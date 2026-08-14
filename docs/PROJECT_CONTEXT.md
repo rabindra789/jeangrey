@@ -12,10 +12,9 @@ Design and Implementation of a Post-Quantum Secure Decentralized Messaging Proto
 
 ## Naming
 
-JeanGrey is the project and protocol name. The end-user application is the
-`jeangrey` command-line tool (Windows `jeangrey.exe` / Android `jeangrey`
-for Termux) which implements the protocol. The protocol name and the
-application name deliberately match.
+JeanGrey is the project and protocol name. The end-user application name
+is **TBD** (to be decided); the current CLI binary ships as `jeangrey`
+(Windows `jeangrey.exe` / Android `jeangrey` for Termux).
 
 ## Status
 
