@@ -4,8 +4,8 @@
 
 | suite | command | scope |
 |---|---|---|
-| unit | `cargo test --lib` | 58 tests: crypto (KEM/ML-DSA/HKDF), handshake (happy path, tampering, timeout), framing (malformed/truncated), session (encryption, replay, ack round trip), records (sign/verify, tamper, skew), identity (Peer ID derivation, key separation) |
-| integration | `cargo test --test integration` | two end-to-end tests (below) |
+| unit | `cargo test --lib` | 62 tests: crypto (KEM/ML-DSA/HKDF), handshake (happy path, tampering, timeout), framing (malformed/truncated), session (encryption, replay, ack round trip), records (sign/verify, tamper, skew), identity (Peer ID derivation, key separation), address lifecycle (local-address filtering, change detection) |
+| integration | `cargo test --test integration` | three end-to-end tests (below) |
 | all | `cargo test --all-targets` | everything; also `cargo clippy --all-targets` and `cargo fmt --check` are clean |
 
 ### Integration tests (`tests/integration/`)
@@ -16,6 +16,12 @@
   the ML-KEM + ML-DSA handshake, sends "hello from charlie", B authenticates
   and acknowledges, C verifies the authenticated ack, B verifies the
   decrypted message. Runtime ~16 s.
+- `address_lifecycle::address_change_is_republished_and_discovered` —
+  three real nodes over loopback: B's reachable address set changes
+  (old listen address removed, new one added); B re-signs and re-publishes
+  its record; C's subsequent lookup returns the NEW verified record and
+  the stale address is gone. Runtime ~9 s. This is the M2.1 regression
+  test for the observed Android network-change failure.
 - `persistence::...` — identity and configuration survive storage
   round-trips.
 

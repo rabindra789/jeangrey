@@ -18,10 +18,45 @@ is **TBD** (to be decided); the current CLI binary ships as `jeangrey`
 
 ## Status
 
-- **MVP-1 / LAN implementation: validated**
-- Released as **v1.0.120** (Git tag `v1.0.120`)
-- 58 unit tests + 2 integration tests passing; clippy clean; fmt clean
+- **MVP-1 / LAN implementation: validated** — released as **v1.0.120**
+  (Git tag `v1.0.120`, release commit `a0139a0`). Tag is a frozen
+  baseline; do not rewrite, retag, or force-push it.
+- **MVP-2 / Internet connectivity: active development**
+  (branch `feature/mvp2-internet-connectivity`)
+- MVP-1 test baseline: 58 unit + 2 integration tests passing; clippy clean; fmt clean
 - Cross-compiled and run on Windows x86_64 and Android ARM64 (Termux, bionic)
+
+## MVP-2 progress
+
+### M2.1 — Dynamic address lifecycle + DHT republishing (implemented)
+
+- Motivating failure (real test, 2026-08-14):
+  `10.174.110.x → 172.20.56.x → stale DHT record → No route to host`
+- Root cause: libp2p's wildcard TCP listener reports new interface
+  addresses but does not expire them when the OS drops the interface;
+  the old IP kept being advertised.
+- Fix: the node keeps `current_addrs` (listen addresses whose IP is still
+  configured locally). An OS interface scan every 5 s
+  (`local_ip_address::list_afinet_netifas`) drops stale addresses;
+  `NewListenAddr`/`ExpiredListenAddr` update the set; any change re-signs
+  the record (fresh `issued_at`) and republishes immediately; the 30 s
+  periodic republish keeps the TTL fresh. A failed scan is fail-safe
+  (nothing dropped). Record format unchanged (no compat break).
+- Tests: 4 new unit tests (filter logic, change detection) + 1 new
+  integration test (`address_change_is_republished_and_discovered`).
+  Suite now: 62 unit + 3 integration, all passing.
+
+### Not yet started (MVP-2 remaining)
+
+- M2.2 dynamic rediscovery (peer-side handling of stale records)
+- M2.3 Internet direct connectivity
+- M2.4 NAT traversal
+- M2.5 relay fallback
+- M2.6 reconnection
+- M2.7 hardening (timeouts, retry/backoff, state machine, CLI diagnostics)
+
+Do NOT mark mailbox/IPFS/Flutter work complete. All future phases remain
+out of scope per `docs/PROJECT_CONTEXT.md` (see below).
 
 ## What the release includes
 
@@ -44,18 +79,19 @@ is **TBD** (to be decided); the current CLI binary ships as `jeangrey`
 - Android ARM64 ↔ Android ARM64 (Termux) over Wi-Fi — bidirectional messages and acks
 - Full annotated logs: `docs/testing.md`
 
-## Known limitations (as released)
+## Known limitations (as released / MVP-2 progress)
 
-- **LAN only.** No NAT traversal, relay, or Internet connectivity.
-- **Stale DHT addresses after Wi-Fi/network change.** When a device's IP
-  changes, previously published DHT address records go stale; peers dialing
-  the old address fail with `No route to host (os error 113)` until
-  re-publication. Address re-publishing / lifecycle management is a future
-  networking phase. Not a cryptographic failure.
+- **LAN only.** No NAT traversal, relay, or Internet connectivity
+  (MVP-2 M2.3–M2.5 pending).
+- **Stale DHT addresses after Wi-Fi/network change — PARTIALLY FIXED
+  (M2.1).** The node now drops addresses whose IP is no longer local and
+  republishes immediately, so its own record stops advertising stale
+  addresses. Not yet done: the *peer side* — rediscovery/replacement of a
+  stale record held by a remote node (M2.2).
 - **No offline delivery.** Messages are delivered directly over an
   established connection; no store-and-forward queue.
 - **Self-send hangs.** Sending to your own Peer ID waits indefinitely for
-  an acknowledgement; a send timeout is planned.
+  an acknowledgement; a send timeout is planned (M2.7).
 
 ## Release artifacts (GitHub release v1.0.120)
 

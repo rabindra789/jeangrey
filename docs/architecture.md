@@ -72,13 +72,56 @@ the expected device Peer ID).
 1. Every node is a Kademlia server (`Mode::Server`) and listens on all
    LAN interfaces.
 2. Every 30 s a node re-publishes its signed address record
-   (`records.rs`) under key `SHA-256(device_peer_id)`.
+   (`records.rs`) under key `SHA-256(device_peer_id)`; see the
+   "Address lifecycle" section below for when it re-publishes early.
 3. A node wanting to reach an unknown peer issues `get_record`; the
    returned record must verify (signature, key, skew) or it is discarded.
 4. The verified address set is dialed concurrently — all addresses in a
    single dial, first success wins, remaining in-flight dials are aborted.
 5. Lookups retry (10 attempts, 1 s apart) to absorb DHT propagation
    (the integration test exercises this path).
+6. Kademlia's same-key replacement means a republished record overwrites
+   the previous one in the DHT, so lookups converge on the newest
+   verified record for a peer.
+
+### Address lifecycle (MVP-2 / M2.1)
+
+Observed failure (Android ↔ Android, 2026-08-14): a peer changed Wi-Fi
+networks (`10.174.110.x` → `172.20.56.x`), kept advertising the old IP,
+and other peers got `No route to host` dialing it. Root cause: libp2p's
+wildcard TCP listener reports new interface addresses (`NewListenAddr`)
+but does not expire per-interface addresses when the OS drops them, so
+the swarm kept treating the old IP as a listen address and records kept
+advertising it.
+
+The node now maintains `current_addrs`, the set of addresses it believes
+are reachable:
+
+```
+NewListenAddr / ExpiredListenAddr (libp2p)
+        +  periodic OS interface scan (every 5 s)
+        └──> current_addrs  (listen addrs ∩ IPs still configured locally)
+                 │
+              change?
+              /    \
+           no       yes
+           │         └──> sign fresh record (new issued_at)
+           │              └──> DHT put_record (immediate)
+           └──> periodic re-publish (30 s) keeps TTL fresh
+```
+
+- `filter_local_addrs` drops any listen address whose IP is no longer
+  configured on a local interface (enumerated with
+  `local_ip_address::list_afinet_netifas`, the same crate used for
+  transport addresses). Loopback is always kept (it cannot go stale).
+- A failed interface scan (returns `None`) is fail-safe: nothing is
+  dropped.
+- The interface scan runs at most every `INTERFACE_SCAN_INTERVAL` (5 s),
+  so the system responds to actual network changes without aggressive
+  polling.
+- Record freshness/expiry is unchanged (TTL 120 s, 30 s skew); the DHT
+  keeps only the newest record per key (same-key replacement), so stale
+  addresses disappear from lookups as soon as the new record propagates.
 
 ## 5. Sessions
 
@@ -99,8 +142,10 @@ the expected device Peer ID).
 `Node::wait_for` / `Node::run` / `run_interactive` poll the swarm and a
 1-second maintenance tick:
 
-- maintenance: publish record, re-dial known peers without sessions,
-  re-issue pending discovery lookups.
+- maintenance: address-lifecycle refresh (interface scan + stale-address
+  removal + immediate republish on change), periodic record publish,
+  re-dial known peers without sessions, re-issue pending discovery
+  lookups.
 - events: session events (established/message/ack/disconnect), DHT events,
   connection lifecycle — all with `node = <name>` log attribution.
 

@@ -5,6 +5,7 @@
 //! application data is exchanged over authenticated JeanGrey sessions.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,9 @@ pub use crate::transport::BehaviourEvent;
 pub const KAD_PROTOCOL: &str = "/jeangrey/kad/1.0.0";
 /// How often our address record is re-published into the DHT.
 pub const PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the local interface set is re-enumerated to detect stale
+/// addresses (a Wi-Fi/network change removes the old IP from the OS).
+pub const INTERFACE_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 /// Maximum times a discovery lookup is re-issued before giving up.
 pub const MAX_LOOKUP_ATTEMPTS: u32 = 10;
 /// Delay between lookup retries (gives the DHT time to learn the record).
@@ -116,13 +120,63 @@ struct LookupRetry {
     next_at: Instant,
 }
 
+/// Filter `addrs` down to the addresses whose IP is still configured on a
+/// local interface. Loopback addresses are always accepted (they cannot go
+/// stale); addresses without an IP protocol component are dropped; the
+/// order of the surviving addresses is preserved and duplicates removed.
+///
+/// This is the core of the address-lifecycle fix: libp2p does not expire a
+/// wildcard listener's per-interface addresses when the underlying network
+/// changes, so the swarm would otherwise keep advertising an IP that the OS
+/// no longer owns (observed as `No route to host` after a Wi-Fi switch).
+pub fn filter_local_addrs(
+    addrs: &[Multiaddr],
+    local_ips: &std::collections::HashSet<IpAddr>,
+) -> Vec<Multiaddr> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for a in addrs {
+        let ip = a.iter().find_map(|p| match p {
+            libp2p::multiaddr::Protocol::Ip4(i) => Some(IpAddr::V4(i)),
+            libp2p::multiaddr::Protocol::Ip6(i) => Some(IpAddr::V6(i)),
+            _ => None,
+        });
+        let keep = match ip {
+            Some(ip) if ip.is_loopback() => true,
+            Some(ip) => local_ips.contains(&ip),
+            None => false,
+        };
+        if keep && seen.insert(a.to_string()) {
+            out.push(a.clone());
+        }
+    }
+    out
+}
+
+/// Enumerate the IPs currently configured on this host. Returns `None` on
+/// scan failure: an unknown interface set must not cause addresses to be
+/// dropped (fail-safe).
+fn local_ip_set() -> Option<HashSet<IpAddr>> {
+    match local_ip_address::list_afinet_netifas() {
+        Ok(list) => Some(list.into_iter().map(|(_, ip)| ip).collect()),
+        Err(e) => {
+            tracing::warn!(error = %e, "interface scan failed; keeping current addresses");
+            None
+        }
+    }
+}
+
 /// A running JeanGrey node.
 pub struct Node {
     pub swarm: Swarm<NodeBehaviour>,
     pub identity: Arc<DeviceIdentity>,
     pub storage: Storage,
     our_record: AddrRecord,
+    /// The addresses we currently believe are reachable on this host
+    /// (swarm listen addresses minus those whose IP is no longer local).
+    current_addrs: Vec<Multiaddr>,
     last_publish: Instant,
+    last_interface_scan: Instant,
     last_bootstrap: Instant,
     connected: HashSet<PeerId>,
     /// Bootstrap peers whose transport Peer ID is not yet known.
@@ -200,7 +254,9 @@ impl Node {
             identity,
             storage,
             our_record,
+            current_addrs: Vec::new(),
             last_publish: Instant::now(),
+            last_interface_scan: Instant::now() - INTERFACE_SCAN_INTERVAL,
             last_bootstrap: Instant::now(),
             connected: HashSet::new(),
             bootstrap_pending: options.bootstrap,
@@ -216,9 +272,69 @@ impl Node {
         self.swarm.listeners().cloned().collect()
     }
 
+    /// The address set currently believed reachable on this host (the
+    /// source of what gets signed into our DHT record).
+    pub fn current_addrs(&self) -> Vec<Multiaddr> {
+        self.current_addrs.clone()
+    }
+
+    /// Record `addr` as one of our listen addresses. Returns `true` if the
+    /// set changed (callers then republish).
+    pub fn note_listen_addr(&mut self, addr: Multiaddr) -> bool {
+        if self.current_addrs.contains(&addr) {
+            return false;
+        }
+        self.current_addrs.push(addr);
+        true
+    }
+
+    /// Remove `addr` from our listen set (it is no longer reachable, e.g.
+    /// the OS dropped the interface). Returns `true` if the set changed.
+    pub fn note_listen_addr_gone(&mut self, addr: &Multiaddr) -> bool {
+        let before = self.current_addrs.len();
+        self.current_addrs.retain(|a| a != addr);
+        self.current_addrs.len() != before
+    }
+
+    /// Re-check our listen addresses against the OS interface set and drop
+    /// any whose IP is no longer configured locally. Runs at most every
+    /// [`INTERFACE_SCAN_INTERVAL`]; publishes immediately on any change.
+    pub fn refresh_local_addresses(&mut self) {
+        if self.last_interface_scan.elapsed() < INTERFACE_SCAN_INTERVAL {
+            return;
+        }
+        self.last_interface_scan = Instant::now();
+        let Some(local_ips) = local_ip_set() else {
+            return;
+        };
+        // Pick up any addresses the swarm reported that we have not seen.
+        for addr in self.swarm.listeners() {
+            if !self.current_addrs.contains(addr) {
+                self.current_addrs.push(addr.clone());
+            }
+        }
+        let filtered = filter_local_addrs(&self.current_addrs, &local_ips);
+        if filtered == self.current_addrs {
+            return;
+        }
+        let dropped: Vec<String> = self
+            .current_addrs
+            .iter()
+            .filter(|a| !filtered.contains(a))
+            .map(|a| a.to_string())
+            .collect();
+        self.current_addrs = filtered;
+        tracing::info!(
+            node = %self.identity.user.user_name,
+            dropped = ?dropped,
+            "dropped stale local address(es); republishing record"
+        );
+        self.publish_record();
+    }
+
     /// Record the current listen addresses and re-publish to the DHT.
     pub fn publish_record(&mut self) {
-        let addrs = self.our_listen_addrs();
+        let addrs = self.current_addrs.clone();
         if addrs.is_empty() {
             return;
         }
@@ -451,6 +567,9 @@ impl Node {
 
     /// Periodic maintenance, shared by all run loops.
     fn maintenance(&mut self) {
+        // Address lifecycle: drop stale local addresses and republish
+        // immediately when the reachable set changes.
+        self.refresh_local_addresses();
         if self.last_publish.elapsed() >= PUBLISH_INTERVAL {
             self.publish_record();
         }
@@ -505,7 +624,16 @@ impl Node {
             }
             SwarmEvent::NewListenAddr { address, .. } => {
                 tracing::info!(node = %self.identity.user.user_name, %address, "listening");
-                self.publish_record();
+                if self.note_listen_addr(address) {
+                    self.publish_record();
+                }
+                None
+            }
+            SwarmEvent::ExpiredListenAddr { address, .. } => {
+                tracing::warn!(node = %self.identity.user.user_name, %address, "listen address expired");
+                if self.note_listen_addr_gone(&address) {
+                    self.publish_record();
+                }
                 None
             }
             SwarmEvent::ConnectionEstablished {
@@ -753,5 +881,85 @@ pub async fn run_interactive(node: &mut Node, mut commands: mpsc::Receiver<NodeC
                 let _ = node.handle_event(event);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn maddr(s: &str) -> Multiaddr {
+        s.parse().unwrap()
+    }
+
+    fn ips(v: &[&str]) -> HashSet<IpAddr> {
+        v.iter().map(|s| s.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn filter_keeps_loopback_and_local_ips() {
+        let addrs = [
+            maddr("/ip4/127.0.0.1/tcp/9000"),
+            maddr("/ip4/10.0.0.5/tcp/9000"),
+            maddr("/ip4/10.9.9.9/tcp/9000"),
+            maddr("/ip6/::1/tcp/9000"),
+        ];
+        let local = ips(&["10.0.0.5", "10.1.1.1"]);
+        let filtered = filter_local_addrs(&addrs, &local);
+        assert_eq!(filtered.len(), 3);
+        assert!(filtered.contains(&maddr("/ip4/127.0.0.1/tcp/9000")));
+        assert!(filtered.contains(&maddr("/ip4/10.0.0.5/tcp/9000")));
+        assert!(filtered.contains(&maddr("/ip6/::1/tcp/9000")));
+        assert!(!filtered.contains(&maddr("/ip4/10.9.9.9/tcp/9000")));
+    }
+
+    #[test]
+    fn filter_drops_addrs_without_ip_and_dedups() {
+        let addrs = [
+            maddr("/ip4/127.0.0.1/tcp/9000"),
+            maddr("/ip4/127.0.0.1/tcp/9000"),
+            maddr("/dns4/example.com/tcp/9000"),
+        ];
+        let local = HashSet::new();
+        let filtered = filter_local_addrs(&addrs, &local);
+        assert_eq!(filtered, vec![maddr("/ip4/127.0.0.1/tcp/9000")]);
+    }
+
+    #[test]
+    fn filter_removes_stale_ip_after_network_change() {
+        // The motivating real-world case: the phone moved from Wi-Fi A
+        // (10.174.110.x) to Wi-Fi B (172.20.56.x); the old IP is gone from
+        // the OS and must not be advertised any longer.
+        let addrs = [
+            maddr("/ip4/10.174.110.167/tcp/9000"),
+            maddr("/ip4/172.20.56.251/tcp/9000"),
+        ];
+        let local = ips(&["172.20.56.251"]);
+        let filtered = filter_local_addrs(&addrs, &local);
+        assert_eq!(filtered, vec![maddr("/ip4/172.20.56.251/tcp/9000")]);
+    }
+
+    #[tokio::test]
+    async fn note_addr_add_remove_change_detection() {
+        let id = crate::identity::DeviceIdentity::generate("addr-test");
+        let storage = crate::storage::Storage::new(
+            std::env::temp_dir().join(format!("jg-addr-test-{}", std::process::id())),
+        );
+        let mut node = Node::new(
+            id,
+            storage,
+            NodeOptions {
+                listen_port: 0,
+                bootstrap: Vec::new(),
+            },
+        )
+        .unwrap();
+        let a = maddr("/ip4/127.0.0.1/tcp/9100");
+        assert!(node.note_listen_addr(a.clone()));
+        assert!(!node.note_listen_addr(a.clone()));
+        assert_eq!(node.current_addrs(), vec![a.clone()]);
+        assert!(node.note_listen_addr_gone(&a));
+        assert!(!node.note_listen_addr_gone(&a));
+        assert!(node.current_addrs().is_empty());
     }
 }

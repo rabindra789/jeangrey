@@ -192,6 +192,25 @@ signature = ML-DSA over "jeangrey/mvp1/addr-record/v1" || record bytes (minus si
   discarded (`verify_addr_record`).
 - Records are re-published every 30 seconds with a 120-second TTL.
 
+### 5.1 Address lifecycle (MVP-2 / M2.1)
+
+Records are additionally re-published **immediately** whenever the node's
+reachable address set changes:
+
+- `NewListenAddr` / `ExpiredListenAddr` swarm events update the set.
+- Every 5 seconds the node re-enumerates the OS interface IPs
+  (`local_ip_address::list_afinet_netifas`) and drops any listen address
+  whose IP is no longer configured locally (loopback is always kept). A
+  failed scan keeps the current set (fail-safe).
+- Any change re-signs the record (fresh `issued_at`) and publishes it
+  immediately; the periodic 30 s re-publish keeps the TTL fresh.
+
+Kademlia stores one record per key, so a republished record overwrites
+the previous one; peers' lookups therefore converge on the newest
+verified record, and the old (stale) address set stops being used once
+the update propagates. There is no record format change — the existing
+`issued_at`/`ttl_secs` freshness rules already express update semantics.
+
 ## 6. Connection and session lifecycle
 
 1. A node with no sessions to a peer issues a DHT lookup, verifies the

@@ -1,5 +1,6 @@
-//! JeanGrey MVP-1 end-to-end integration tests (M9).
+//! JeanGrey end-to-end integration tests.
 
+mod address_lifecycle;
 mod messaging;
 mod persistence;
 
