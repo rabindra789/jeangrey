@@ -5,6 +5,13 @@
 **Release: v1.0.120**
 
 > This release is a LAN-focused decentralized messaging implementation.
+>
+> **Naming:** JeanGrey is the name of the project and of the messaging
+> protocol it specifies. The end-user application — the command-line tool
+> `jeangrey` (with its Windows and Android builds) — implements that
+> protocol. The protocol name and the application name deliberately match;
+> wherever this README says "JeanGrey", it refers to the protocol, and
+> wherever it says `jeangrey`, it refers to the executable.
 
 JeanGrey is a decentralized messaging protocol whose security is built
 entirely on post-quantum primitives:

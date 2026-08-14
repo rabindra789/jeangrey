@@ -10,6 +10,13 @@ Design and Implementation of a Post-Quantum Secure Decentralized Messaging Proto
 - Current release: **v1.0.120**
 - License: MIT
 
+## Naming
+
+JeanGrey is the project and protocol name. The end-user application is the
+`jeangrey` command-line tool (Windows `jeangrey.exe` / Android `jeangrey`
+for Termux) which implements the protocol. The protocol name and the
+application name deliberately match.
+
 ## Status
 
 - **MVP-1 / LAN implementation: validated**

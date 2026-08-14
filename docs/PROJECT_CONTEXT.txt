@@ -10,6 +10,12 @@ Project identity
   Release    : v1.0.120
   License    : MIT
 
+Naming
+  JeanGrey is the project and protocol name. The end-user application is
+  the jeangrey command-line tool (Windows jeangrey.exe / Android jeangrey
+  for Termux) which implements the protocol. The protocol name and the
+  application name deliberately match.
+
 Status
   MVP-1 / LAN implementation : VALIDATED
   Released as v1.0.120 (Git tag v1.0.120)

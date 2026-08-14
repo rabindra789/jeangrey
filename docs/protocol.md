@@ -6,7 +6,7 @@ reference for `src/handshake.rs`, `src/framing.rs`, `src/session.rs`,
 
 ## 1. Overview
 
-All JeanGrey application traffic runs over a single libp2p stream protocol
+All `jeangrey` application traffic runs over a single libp2p stream protocol
 `/jeangrey/session/1.0.0` multiplexed over a transport connection
 (TCP + yamux). Discovery traffic runs over Kademlia with protocol name
 `/jeangrey/kad/1.0.0`.
