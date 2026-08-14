@@ -1,0 +1,10 @@
+/target
+/.jeangrey
+/data
+/docs/demo
+*.pem
+*.key
+identity.json
+*.log
+.DS_Store
+Thumbs.db
