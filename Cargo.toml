@@ -1,6 +1,6 @@
 [package]
 name = "jeangrey"
-version = "1.0.120"
+version = "1.1.121"
 edition = "2021"
 description = "Post-Quantum Secure Decentralized Messaging Protocol (LAN implementation)"
 license = "MIT"
