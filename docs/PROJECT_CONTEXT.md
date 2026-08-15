@@ -7,7 +7,7 @@ Design and Implementation of a Post-Quantum Secure Decentralized Messaging Proto
 ## Project identity
 
 - Repository: `jeangrey` (GitHub)
-- Current release: **v1.0.120**
+- Current release: **v1.2.0**
 - License: MIT
 
 ## Naming
@@ -212,11 +212,13 @@ out of scope per `docs/PROJECT_CONTEXT.md` (see below).
 - **Self-send hangs.** Sending to your own Peer ID waits indefinitely for
   an acknowledgement; a send timeout is planned (M2.7).
 
-## Release artifacts (GitHub release v1.0.120)
+## Release artifacts (GitHub releases)
 
-- `jeangrey-v1.0.120-windows-x86_64.zip` — Windows x86_64 executable (`jeangrey.exe`) + README.txt
-- `jeangrey-v1.0.120-android-aarch64.tar.gz` — Android ARM64 executable (`jeangrey`) for Termux
-- `SHA256SUMS` — SHA-256 checksums for both assets
+- v1.0.120 (MVP-1): `jeangrey-v1.0.120-windows-x86_64.zip`,
+  `jeangrey-v1.0.120-android-aarch64.tar.gz`, `SHA256SUMS`
+- v1.2.0 (MVP-2, M2.1–M2.4): `jeangrey-v1.2.0-windows-x86_64.zip`,
+  `jeangrey-v1.2.0-android-aarch64.tar.gz`, `SHA256SUMS`
+  (each zip/tar.gz bundles its own `README.txt`)
 
 ## Build notes
 
@@ -226,7 +228,7 @@ out of scope per `docs/PROJECT_CONTEXT.md` (see below).
   Termux only (not a standalone Android app)
 - Cargo linker config for Android lives in `~/.cargo/config.toml` (user-local)
 
-## Out of scope (future phases, NOT claimed in v1.0.120)
+## Out of scope (future phases, NOT claimed in v1.2.0)
 
 - Internet-wide connectivity (guaranteed reachability via relay
   fallback — M2.5), store-and-forward relay

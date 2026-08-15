@@ -7,7 +7,7 @@ Formal title
 
 Project identity
   Repository : jeangrey (GitHub)
-  Release    : v1.0.120
+  Release    : v1.2.0 (published); v1.0.120 (MVP-1)
   License    : MIT
 
 Naming
@@ -166,7 +166,7 @@ Build notes
     Termux only, not a standalone Android app
   - Android cargo linker config lives in ~/.cargo/config.toml (user-local)
 
-Out of scope (future phases, NOT claimed in v1.1.121)
+Out of scope (future phases, NOT claimed in v1.2.0)
   - Internet-wide connectivity (guaranteed reachability via relay
     fallback - M2.5), store-and-forward relay
   - offline mailbox / store-and-forward

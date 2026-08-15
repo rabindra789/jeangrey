@@ -116,7 +116,7 @@ JEANGREY_TEST_LOG=jeangrey=debug cargo test --test integration -- messaging
 
 **Project:** JeanGrey — Post-Quantum Secure Decentralized Messaging Protocol
 **Milestone:** MVP-2, milestones M2.1–M2.4 (Internet connectivity groundwork)
-**Release:** v1.1.121
+**Release:** v1.2.0
 **Date:** 2026-08-15
 **Status:** COMPLETE for M2.1–M2.4; M2.5 relay fallback and beyond pending
 
@@ -186,6 +186,6 @@ cargo check --target aarch64-linux-android -> clean
 15. **All TEMP debug logging was removed** before release; the `peers`
     listing surfaces connection paths and `[nat]`/`[connect]` logs report
     transitions.
-16. **Release artifacts are NOT published yet** at the time this report is
-    committed; the v1.1.121 tag is frozen but the GitHub release step is
-    pending.
+16. **Release:** published as v1.2.0 (the earlier v1.1.121 tag at commit
+    `66c2bcc` remains frozen as a version-bump baseline; the M2.4 code
+    ships under v1.2.0).
