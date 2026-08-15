@@ -46,9 +46,27 @@ is **TBD** (to be decided); the current CLI binary ships as `jeangrey`
   integration test (`address_change_is_republished_and_discovered`).
   Suite now: 62 unit + 3 integration, all passing.
 
+### M2.2 — Dynamic rediscovery of stale records (implemented)
+
+- Peer-side counterpart of M2.1: a node holding a stale cached record
+  must recover when the remote moves. On session loss the node re-dials
+  the cached address once (2 s) while scheduling a DHT lookup (3 s,
+  1 s retries, ≤ 10 attempts). Dial failures (`DialError::Transport`)
+  invalidate the failed candidates; `WrongPeerId` invalidates the whole
+  record. A verified record replaces the cache whenever its `issued_at`
+  is not older (equal timestamps still re-dial — a re-fetched record is
+  never dropped silently).
+- Dials allocate fresh ephemeral source ports (`PortUse::New`): on
+  Windows, listener-port reuse for outgoing dials collides with the
+  live listener (`WSAEADDRINUSE`). A `bootstrap_dialing` guard prevents
+  duplicate dials to the same address.
+- Tests: 2 new unit tests (invalidation + rediscovery dedup) + 1 new
+  integration test (`stale_cached_address_recovers_via_rediscovery`,
+  B1 dies → stale 9242 refused → rediscovery → B2's 9244 → session +
+  authenticated ack). Suite now: 66 unit + 4 integration, all passing.
+
 ### Not yet started (MVP-2 remaining)
 
-- M2.2 dynamic rediscovery (peer-side handling of stale records)
 - M2.3 Internet direct connectivity
 - M2.4 NAT traversal
 - M2.5 relay fallback
@@ -83,11 +101,10 @@ out of scope per `docs/PROJECT_CONTEXT.md` (see below).
 
 - **LAN only.** No NAT traversal, relay, or Internet connectivity
   (MVP-2 M2.3–M2.5 pending).
-- **Stale DHT addresses after Wi-Fi/network change — PARTIALLY FIXED
-  (M2.1).** The node now drops addresses whose IP is no longer local and
-  republishes immediately, so its own record stops advertising stale
-  addresses. Not yet done: the *peer side* — rediscovery/replacement of a
-  stale record held by a remote node (M2.2).
+- **Stale DHT addresses after Wi-Fi/network change — FIXED (M2.1 + M2.2).**
+  The publisher drops addresses whose IP is no longer local and
+  republishes immediately (M2.1); the peer side invalidates failed
+  cached addresses and redisovers the fresh record via the DHT (M2.2).
 - **No offline delivery.** Messages are delivered directly over an
   established connection; no store-and-forward queue.
 - **Self-send hangs.** Sending to your own Peer ID waits indefinitely for

@@ -159,10 +159,10 @@ See [`docs/testing.md`](docs/testing.md) for the full walkthroughs and logs.
 - **LAN only.** No NAT traversal, relay, or Internet connectivity.
 - **Stale DHT addresses.** When a device changes Wi-Fi networks and
   receives a new IP address, previously published address records become
-  stale. Peers dialing the old address fail with `No route to host (os
-  error 113)` until the record is re-published (address lifecycle
-  management is a future networking phase — this is not a cryptographic
-  failure).
+  stale. On the branch in development (`feature/mvp2-internet-connectivity`),
+  the publisher re-signs and republishes its record when its address set
+  changes (M2.1), and peers holding a stale cached record invalidate it
+  on dial failure and rediscover the fresh record via the DHT (M2.2).
 - **No offline delivery.** Messages are delivered directly over an
   established connection; there is no store-and-forward queue.
 - **Sending to your own Peer ID** hangs in `awaiting acknowledgement...`

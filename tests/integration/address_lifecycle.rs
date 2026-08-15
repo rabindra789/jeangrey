@@ -104,14 +104,13 @@ async fn address_change_is_republished_and_discovered() {
     drive_both_until(
         &mut b,
         &mut c,
-        |n| n.discovered.iter().any(|r| r.peer_id == peer_b),
+        |n| n.records.iter().any(|(p, _)| *p == peer_b),
         TIMEOUT,
     )
     .await;
     let original = c
-        .discovered
-        .iter()
-        .find(|r| r.peer_id == peer_b)
+        .records
+        .get(&peer_b)
         .expect("B's record must be discovered");
     assert!(
         original
@@ -134,26 +133,24 @@ async fn address_change_is_republished_and_discovered() {
     b.run_for(Duration::from_secs(2)).await;
 
     // C looks B up again: the DHT now returns the NEW record.
-    c.discovered.clear();
+    c.records.clear();
     let _ = c.lookup(peer_b);
     drive_both_until(
         &mut b,
         &mut c,
         |n| {
-            n.discovered.iter().any(|r| {
-                r.peer_id == peer_b
-                    && r.addrs
-                        .iter()
-                        .any(|a| a.to_string().contains("127.0.0.1/tcp/9242"))
+            n.records.get(&peer_b).is_some_and(|r| {
+                r.addrs
+                    .iter()
+                    .any(|a| a.to_string().contains("127.0.0.1/tcp/9242"))
             })
         },
         TIMEOUT,
     )
     .await;
     let updated = c
-        .discovered
-        .iter()
-        .find(|r| r.peer_id == peer_b)
+        .records
+        .get(&peer_b)
         .expect("B's updated record must be discovered");
     assert!(
         !updated

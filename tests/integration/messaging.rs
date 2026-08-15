@@ -96,7 +96,7 @@ async fn discovery_session_and_message_round_trip() {
     assert!(established.is_some(), "C must establish a session with B");
 
     assert!(
-        c.discovered.iter().any(|r| r.peer_id == peer_b),
+        c.records.iter().any(|(p, _)| *p == peer_b),
         "B's address record must have been retrieved and verified"
     );
 

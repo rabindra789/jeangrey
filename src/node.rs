@@ -13,7 +13,7 @@ use futures::StreamExt;
 use libp2p::core::upgrade::Version;
 use libp2p::kad::store::MemoryStore;
 use libp2p::kad::{self, QueryId, RecordKey};
-use libp2p::swarm::{Config as SwarmConfig, NetworkBehaviour, Swarm, SwarmEvent};
+use libp2p::swarm::{Config as SwarmConfig, DialError, NetworkBehaviour, Swarm, SwarmEvent};
 use libp2p::{Multiaddr, PeerId, Transport as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -36,6 +36,12 @@ pub const INTERFACE_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 pub const MAX_LOOKUP_ATTEMPTS: u32 = 10;
 /// Delay between lookup retries (gives the DHT time to learn the record).
 pub const LOOKUP_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Delay before re-dialing the CACHED address record of a peer whose session
+/// was lost (the cached set may be stale; the dial failure drives
+/// invalidation + rediscovery).
+pub const RECONNECT_DIAL_DELAY: Duration = Duration::from_secs(2);
+/// Delay before a dynamic rediscovery lookup after a session loss.
+pub const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 
 /// Composed network behaviour.
 #[derive(NetworkBehaviour)]
@@ -120,6 +126,16 @@ struct LookupRetry {
     next_at: Instant,
 }
 
+/// A re-dial of a peer's cached address record (scheduled after session
+/// loss; single attempt — a failure invalidates the cached candidates and
+/// the scheduled rediscovery takes over).
+struct RetryDial {
+    peer: PeerId,
+    transport: PeerId,
+    addrs: Vec<Multiaddr>,
+    next_at: Instant,
+}
+
 /// Filter `addrs` down to the addresses whose IP is still configured on a
 /// local interface. Loopback addresses are always accepted (they cannot go
 /// stale); addresses without an IP protocol component are dropped; the
@@ -183,12 +199,26 @@ pub struct Node {
     bootstrap_pending: Vec<BootstrapPeer>,
     /// Bootstrap peers whose transport Peer ID has been learned.
     bootstrap_mapped: HashSet<PeerId>,
+    /// Bootstrap peer addresses with a dial in flight (dedup: prevents a
+    /// second dial while the first connection is still being set up, which
+    /// would collide with the in-flight tuple on the same loopback port).
+    bootstrap_dialing: HashSet<Multiaddr>,
     /// In-flight discovery queries.
     pending_lookups: HashMap<QueryId, LookupRequest>,
     /// Failed lookups waiting for their retry window.
     retry_lookups: VecDeque<LookupRetry>,
-    /// Peers discovered through verified DHT records.
-    pub discovered: Vec<VerifiedRecord>,
+    /// Peers with a dial in flight (dedup; keyed by device Peer ID).
+    dialing: HashSet<PeerId>,
+    /// Peers with which a session has been established at least once (they
+    /// are reconnection candidates on disconnect).
+    had_session: HashSet<PeerId>,
+    /// Re-dials of cached address records waiting for their fire time.
+    retry_dials: VecDeque<RetryDial>,
+    /// The latest verified DHT record per device (keyed by device Peer ID).
+    /// A verified record REPLACES an older one for the same device; a dial
+    /// failure removes the failed candidates (possibly the whole record),
+    /// which triggers a dynamic rediscovery.
+    pub records: HashMap<PeerId, VerifiedRecord>,
 }
 
 impl Node {
@@ -257,13 +287,19 @@ impl Node {
             current_addrs: Vec::new(),
             last_publish: Instant::now(),
             last_interface_scan: Instant::now() - INTERFACE_SCAN_INTERVAL,
-            last_bootstrap: Instant::now(),
+            // Due immediately: the first maintenance tick dials the
+            // bootstrap peers without waiting out a full interval.
+            last_bootstrap: Instant::now() - Duration::from_secs(5),
             connected: HashSet::new(),
             bootstrap_pending: options.bootstrap,
             bootstrap_mapped: HashSet::new(),
+            bootstrap_dialing: HashSet::new(),
             pending_lookups: HashMap::new(),
             retry_lookups: VecDeque::new(),
-            discovered: Vec::new(),
+            dialing: HashSet::new(),
+            had_session: HashSet::new(),
+            retry_dials: VecDeque::new(),
+            records: HashMap::new(),
         };
         Ok(node)
     }
@@ -406,11 +442,132 @@ impl Node {
 
     /// Dial a device directly. `transport` is the device's libp2p transport
     /// Peer ID (from its verified address record); `peer` is the device id.
+    /// No-op while a dial for `peer` is already in flight (dedup).
     pub fn dial_peer(&mut self, peer: PeerId, transport: PeerId, addrs: Vec<Multiaddr>) {
+        if !self.dialing.insert(peer) {
+            return;
+        }
         self.swarm
             .behaviour_mut()
             .session
             .connect(peer, transport, addrs);
+    }
+
+    /// The latest verified DHT records (one per device).
+    pub fn records(&self) -> Vec<VerifiedRecord> {
+        self.records.values().cloned().collect()
+    }
+
+    /// Whether a discovery lookup for `peer` is pending or already queued.
+    fn lookup_in_flight(&self, peer: &PeerId) -> bool {
+        self.pending_lookups.values().any(|r| &r.peer == peer)
+            || self.retry_lookups.iter().any(|r| &r.peer == peer)
+    }
+
+    /// Schedule a dynamic rediscovery lookup for `peer` (deduplicated).
+    fn schedule_rediscovery(&mut self, peer: PeerId, delay: Duration) {
+        if self.lookup_in_flight(&peer) {
+            return;
+        }
+        self.retry_lookups.push_back(LookupRetry {
+            peer,
+            attempts: 1,
+            next_at: Instant::now() + delay,
+        });
+        tracing::info!(
+            node = %self.identity.user.user_name,
+            peer = %short_id(&peer),
+            delay = ?delay,
+            "scheduling dynamic rediscovery"
+        );
+    }
+
+    /// Schedule reconnection to `peer` after its session was lost: re-dial
+    /// the cached address record once (it may be stale — the dial failure
+    /// then invalidates it), and in parallel refresh the record from the
+    /// DHT.
+    fn schedule_reconnect(&mut self, peer: PeerId) {
+        let Some(record) = self.records.get(&peer).cloned() else {
+            tracing::debug!(
+                node = %self.identity.user.user_name,
+                peer = %short_id(&peer),
+                "no cached record; skipping reconnect"
+            );
+            return;
+        };
+        if !self.dialing.contains(&peer) && !self.has_session(&peer) {
+            self.retry_dials.push_back(RetryDial {
+                peer,
+                transport: record.transport_peer,
+                addrs: record.addrs,
+                next_at: Instant::now() + RECONNECT_DIAL_DELAY,
+            });
+        }
+        self.schedule_rediscovery(peer, RECONNECT_DELAY);
+    }
+
+    /// Drop `failed` addresses from the cached record of `device` (dial
+    /// failures prove they are not reachable). A record with no surviving
+    /// candidates is removed entirely; the caller schedules the rediscovery.
+    fn invalidate_candidates(&mut self, device: PeerId, failed: &[Multiaddr]) {
+        if failed.is_empty() {
+            return;
+        }
+        let Some(record) = self.records.get_mut(&device) else {
+            return;
+        };
+        let before = record.addrs.len();
+        record.addrs.retain(|a| !failed.contains(a));
+        if record.addrs.len() == before {
+            return;
+        }
+        if record.addrs.is_empty() {
+            self.records.remove(&device);
+            tracing::warn!(
+                node = %self.identity.user.user_name,
+                peer = %short_id(&device),
+                "cached address record fully stale; removed (rediscovery scheduled)"
+            );
+        } else {
+            tracing::info!(
+                node = %self.identity.user.user_name,
+                peer = %short_id(&device),
+                removed = before - record.addrs.len(),
+                "dropped failed address candidate(s) from cached record"
+            );
+        }
+    }
+
+    /// Cache a freshly verified DHT record (newest wins per device) and dial
+    /// it unless a dial or session already covers the peer.
+    fn on_verified_record(&mut self, verified: VerifiedRecord) {
+        let replace = match self.records.get(&verified.peer_id) {
+            // An equal `issued_at` means the very same record was re-fetched
+            // (e.g. a rediscovery lookup after a dial failure): still replace
+            // and re-dial — a strict `<` would silently drop the reconnect.
+            Some(old) => old.issued_at <= verified.issued_at,
+            None => true,
+        };
+        if !replace {
+            return;
+        }
+        let dial =
+            !self.dialing.contains(&verified.peer_id) && !self.has_session(&verified.peer_id);
+        tracing::info!(
+            node = %self.identity.user.user_name,
+            peer = %short_id(&verified.peer_id),
+            device = %hex::encode(verified.device_uuid),
+            addrs = verified.addrs.len(),
+            "verified DHT address record"
+        );
+        self.records.insert(verified.peer_id, verified.clone());
+        if dial {
+            self.dial_peer(
+                verified.peer_id,
+                verified.transport_peer,
+                verified.addrs.clone(),
+            );
+        }
     }
 
     fn on_kad_event(&mut self, event: kad::Event) {
@@ -428,22 +585,10 @@ impl Node {
                     if let Ok(record) = AddrRecord::from_bytes(&peer_record.record.value) {
                         match records::verify_addr_record(&key, &record, now) {
                             Ok(verified) => {
-                                tracing::info!(
-                                    node = %self.identity.user.user_name,
-                                    peer = %short_id(&verified.peer_id),
-                                    device = %hex::encode(verified.device_uuid),
-                                    addrs = verified.addrs.len(),
-                                    "verified DHT address record"
-                                );
-                                // Discovery leads to connection: dial the
-                                // authenticated address set via the transport id
-                                // bound in the signed record.
-                                self.dial_peer(
-                                    verified.peer_id,
-                                    verified.transport_peer,
-                                    verified.addrs.clone(),
-                                );
-                                self.discovered.push(verified);
+                                // Cache the newest verified record per device
+                                // and dial it (unless already covered); the
+                                // record becomes the reconnect candidate set.
+                                self.on_verified_record(verified);
                             }
                             Err(e) => {
                                 tracing::warn!(node = %self.identity.user.user_name, error = %e, "rejected DHT record");
@@ -497,6 +642,8 @@ impl Node {
                     device = %hex::encode(result.peer_hello.device_uuid),
                     "session established (ML-KEM + ML-DSA authenticated)"
                 );
+                self.had_session.insert(*peer_id);
+                self.dialing.remove(peer_id);
                 let _ = self
                     .storage
                     .append_history(crate::storage::HistoryKind::Sent {
@@ -560,6 +707,12 @@ impl Node {
             BehaviourEvent::PeerDisconnected { peer_id } => {
                 self.connected.remove(peer_id);
                 tracing::info!(node = %self.identity.user.user_name, peer = %short_id(peer_id), "peer disconnected");
+                // Reconnect: the peer had a session; re-dial its cached
+                // record (which may be stale — the failure invalidates it)
+                // and refresh the record from the DHT in parallel.
+                if self.had_session.remove(peer_id) {
+                    self.schedule_reconnect(*peer_id);
+                }
             }
         }
         event
@@ -572,6 +725,25 @@ impl Node {
         self.refresh_local_addresses();
         if self.last_publish.elapsed() >= PUBLISH_INTERVAL {
             self.publish_record();
+        }
+        // Fire scheduled re-dials of cached address records (reconnect).
+        let now = Instant::now();
+        while let Some(dial) = self.retry_dials.front() {
+            if dial.next_at > now {
+                break;
+            }
+            let dial = self.retry_dials.pop_front().unwrap();
+            // A concurrent rediscovery may already have reconnected us.
+            if self.has_session(&dial.peer) || self.dialing.contains(&dial.peer) {
+                continue;
+            }
+            tracing::info!(
+                node = %self.identity.user.user_name,
+                peer = %short_id(&dial.peer),
+                addrs = dial.addrs.len(),
+                "re-dialing cached address record after disconnect"
+            );
+            self.dial_peer(dial.peer, dial.transport, dial.addrs);
         }
         // Re-issue failed discovery lookups once their retry window elapses.
         let now = Instant::now();
@@ -604,7 +776,19 @@ impl Node {
         {
             self.last_bootstrap = Instant::now();
             for bp in &self.bootstrap_pending {
-                if !self.bootstrap_mapped.contains(&bp.peer_id()) {
+                if !self.bootstrap_mapped.contains(&bp.peer_id())
+                    && bp
+                        .multiaddrs()
+                        .iter()
+                        .all(|a| !self.bootstrap_dialing.contains(a))
+                {
+                    tracing::debug!(
+                        node = %self.identity.user.user_name,
+                        addresses = ?bp.multiaddrs(),
+                        "dialing bootstrap peer"
+                    );
+                    self.bootstrap_dialing
+                        .extend(bp.multiaddrs().iter().cloned());
                     self.swarm
                         .behaviour_mut()
                         .session
@@ -653,6 +837,8 @@ impl Node {
                         .find(|bp| bp.multiaddrs().iter().any(|a| a == address))
                     {
                         if self.bootstrap_mapped.insert(bp.peer_id()) {
+                            self.bootstrap_dialing
+                                .retain(|a| !bp.multiaddrs().iter().any(|b| b == a));
                             self.swarm
                                 .behaviour_mut()
                                 .session
@@ -689,6 +875,16 @@ impl Node {
                 num_established,
                 cause,
             } => {
+                // A dial that was superseded or failed at the transport
+                // layer clears the dialing guard so a fresh lookup can dial.
+                if let Some(device) = self.swarm.behaviour().session.device_of(&peer_id) {
+                    self.dialing.remove(&device);
+                }
+                // If a bootstrap connection closed before its transport Peer
+                // ID was learned, allow the bootstrap loop to re-dial it.
+                if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
+                    self.bootstrap_dialing.remove(address);
+                }
                 tracing::debug!(
                     node = %self.identity.user.user_name,
                     peer = %short_id(&peer_id),
@@ -706,6 +902,40 @@ impl Node {
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 tracing::warn!(node = %self.identity.user.user_name, peer = ?peer_id, error = %error, "dial failed");
+                // M2.2: a failed dial proves the attempted addresses are not
+                // reachable — drop them from the cached record and refresh
+                // it from the DHT (dynamic rediscovery). Bootstrap dials
+                // (unknown device) have no cached record and are left alone.
+                let device = peer_id.and_then(|t| self.swarm.behaviour().session.device_of(&t));
+                let failed: Vec<Multiaddr> = match &error {
+                    DialError::Transport(failures) => {
+                        failures.iter().map(|(a, _)| a.clone()).collect()
+                    }
+                    DialError::WrongPeerId { .. } => {
+                        // The address is live but belongs to a DIFFERENT
+                        // transport id: the cached binding is wrong. Treat
+                        // the whole record as stale.
+                        if let Some(d) = device {
+                            self.records.remove(&d);
+                        }
+                        Vec::new()
+                    }
+                    _ => Vec::new(),
+                };
+                if peer_id.is_none() {
+                    // Peerless bootstrap dial: release the per-address
+                    // in-flight guard so the bootstrap loop can re-dial.
+                    for addr in &failed {
+                        self.bootstrap_dialing.remove(addr);
+                    }
+                }
+                if let Some(d) = device {
+                    if !failed.is_empty() {
+                        self.invalidate_candidates(d, &failed);
+                        self.schedule_rediscovery(d, LOOKUP_RETRY_DELAY);
+                    }
+                    self.dialing.remove(&d);
+                }
                 None
             }
             _ => None,
@@ -874,7 +1104,8 @@ pub async fn run_interactive(node: &mut Node, mut commands: mpsc::Receiver<NodeC
                     .partition(|(deadline, _)| *deadline <= now);
                 lookup_waiters = keep;
                 for (_, reply) in done {
-                    let _ = reply.send(std::mem::take(&mut node.discovered));
+                    let _ = reply
+                        .send(std::mem::take(&mut node.records).into_values().collect());
                 }
             }
             event = node.swarm.select_next_some() => {
@@ -961,5 +1192,120 @@ mod tests {
         assert!(node.note_listen_addr_gone(&a));
         assert!(!node.note_listen_addr_gone(&a));
         assert!(node.current_addrs().is_empty());
+    }
+
+    fn test_node(name: &str) -> Node {
+        let id = crate::identity::DeviceIdentity::generate(name);
+        let storage = crate::storage::Storage::new(
+            std::env::temp_dir().join(format!("jg-unit-{name}-{}", std::process::id())),
+        );
+        Node::new(
+            id,
+            storage,
+            NodeOptions {
+                listen_port: 0,
+                bootstrap: Vec::new(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn verified_record(
+        identity: &crate::identity::DeviceIdentity,
+        addrs: &[&str],
+    ) -> VerifiedRecord {
+        let addrs: Vec<Multiaddr> = addrs.iter().map(|s| s.parse().unwrap()).collect();
+        let record = records::sign_addr_record(identity, &addrs);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        records::verify_addr_record(&identity.peer_id.to_bytes(), &record, now).unwrap()
+    }
+
+    #[tokio::test]
+    async fn schedule_rediscovery_dedups_same_peer() {
+        let mut node = test_node("rediscovery-dedup");
+        let peer = node.identity.peer_id;
+        node.schedule_rediscovery(peer, LOOKUP_RETRY_DELAY);
+        node.schedule_rediscovery(peer, LOOKUP_RETRY_DELAY);
+        assert_eq!(
+            node.retry_lookups.iter().filter(|r| r.peer == peer).count(),
+            1,
+            "a peer with a lookup in flight must not get a duplicate"
+        );
+        assert_eq!(
+            node.retry_lookups.front().unwrap().attempts,
+            1,
+            "rediscovery starts its own bounded retry budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn dialing_guard_prevents_duplicate_dials() {
+        let mut node = test_node("dialing-guard");
+        let device = node.identity.peer_id;
+        let transport = crate::identity::DeviceIdentity::generate("remote").transport_peer_id();
+        let addr = maddr("/ip4/127.0.0.1/tcp/9300");
+        node.dial_peer(device, transport, vec![addr.clone()]);
+        node.dial_peer(device, transport, vec![addr]);
+        assert_eq!(node.dialing.len(), 1, "second dial must be a no-op");
+    }
+
+    #[tokio::test]
+    async fn verified_record_cached_once_and_replaced_when_newer() {
+        let mut node = test_node("cache-latest");
+        let target = crate::identity::DeviceIdentity::generate("target");
+        let mut older = verified_record(&target, &["/ip4/127.0.0.1/tcp/9301"]);
+        older.issued_at -= 1000;
+        let newer = verified_record(&target, &["/ip4/127.0.0.1/tcp/9302"]);
+
+        node.on_verified_record(older.clone());
+        node.on_verified_record(newer.clone());
+        assert_eq!(
+            node.records().len(),
+            1,
+            "one device keeps one cached record"
+        );
+        assert_eq!(
+            node.records().first().unwrap().issued_at,
+            newer.issued_at,
+            "the newer record wins"
+        );
+        assert!(node
+            .records()
+            .first()
+            .unwrap()
+            .addrs
+            .iter()
+            .any(|a| a.to_string().contains("9302")));
+
+        // An older record arriving late must not replace the newer one.
+        node.on_verified_record(older);
+        assert_eq!(node.records().first().unwrap().issued_at, newer.issued_at);
+    }
+
+    #[tokio::test]
+    async fn invalidate_candidates_drops_failed_addrs_and_empty_records() {
+        let mut node = test_node("invalidate");
+        let target = crate::identity::DeviceIdentity::generate("target");
+        let record = verified_record(
+            &target,
+            &["/ip4/127.0.0.1/tcp/9310", "/ip4/127.0.0.1/tcp/9311"],
+        );
+        node.records.insert(target.peer_id, record);
+
+        node.invalidate_candidates(target.peer_id, &[maddr("/ip4/127.0.0.1/tcp/9310")]);
+        assert_eq!(
+            node.records.get(&target.peer_id).unwrap().addrs,
+            vec![maddr("/ip4/127.0.0.1/tcp/9311")],
+            "only the failed candidate is dropped"
+        );
+
+        node.invalidate_candidates(target.peer_id, &[maddr("/ip4/127.0.0.1/tcp/9311")]);
+        assert!(
+            !node.records.contains_key(&target.peer_id),
+            "a record with no surviving candidates is removed"
+        );
     }
 }

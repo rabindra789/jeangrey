@@ -291,7 +291,9 @@ async fn cmd_lookup(common: &Common, peer: &str) -> Result<()> {
     let mut node = new_node(common)?;
     let _ = node.lookup(peer_id);
     node.wait_for(|_| false, LOOKUP_TIMEOUT).await;
-    let discovered = std::mem::take(&mut node.discovered);
+    let discovered = std::mem::take(&mut node.records)
+        .into_values()
+        .collect::<Vec<_>>();
     if discovered.is_empty() {
         println!("no verified record found for {peer_id}");
         return Ok(());

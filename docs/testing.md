@@ -4,8 +4,8 @@
 
 | suite | command | scope |
 |---|---|---|
-| unit | `cargo test --lib` | 62 tests: crypto (KEM/ML-DSA/HKDF), handshake (happy path, tampering, timeout), framing (malformed/truncated), session (encryption, replay, ack round trip), records (sign/verify, tamper, skew), identity (Peer ID derivation, key separation), address lifecycle (local-address filtering, change detection) |
-| integration | `cargo test --test integration` | three end-to-end tests (below) |
+| unit | `cargo test --lib` | 66 tests: crypto (KEM/ML-DSA/HKDF), handshake (happy path, tampering, timeout), framing (malformed/truncated), session (encryption, replay, ack round trip), records (sign/verify, tamper, skew), identity (Peer ID derivation, key separation), address lifecycle (local-address filtering, change detection), stale-record handling (dial-failure invalidation, rediscovery scheduling, dedup) |
+| integration | `cargo test --test integration` | four end-to-end tests (below) |
 | all | `cargo test --all-targets` | everything; also `cargo clippy --all-targets` and `cargo fmt --check` are clean |
 
 ### Integration tests (`tests/integration/`)
@@ -22,6 +22,15 @@
   its record; C's subsequent lookup returns the NEW verified record and
   the stale address is gone. Runtime ~9 s. This is the M2.1 regression
   test for the observed Android network-change failure.
+- `stale_rediscovery::stale_cached_address_recovers_via_rediscovery` —
+  four real nodes over loopback (A anchor, B1 at 9242, C, B2 at 9244 with
+  B1's identity): C caches B1's record and forms a session; B1 dies; C's
+  session is lost, the cached 9242 re-dial fails (connection refused), the
+  stale candidates are invalidated, the DHT lookup returns B2's fresh
+  9244 record, C reconnects and a message round-trips with an
+  authenticated ack. Runtime ~10 s. This is the M2.2 regression test.
+  On Windows the test brings nodes up one at a time so no two dials to
+  the same destination race for a source port (`WSAEADDRINUSE`).
 - `persistence::...` — identity and configuration survive storage
   round-trips.
 

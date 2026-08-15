@@ -120,7 +120,7 @@ pub fn sign_addr_record(identity: &DeviceIdentity, addrs: &[Multiaddr]) -> AddrR
 }
 
 /// Verification outcome for a DHT record.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VerifiedRecord {
     pub peer_id: libp2p::PeerId,
     pub user_id: [u8; 16],

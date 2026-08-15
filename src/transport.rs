@@ -478,7 +478,10 @@ impl SessionBehaviour {
         self.transport_devices.insert(transport, device);
         self.device_transports.insert(device, transport);
         self.queue.push_back(ToSwarm::Dial {
-            opts: DialOpts::peer_id(transport).addresses(addrs).build(),
+            opts: DialOpts::peer_id(transport)
+                .addresses(addrs)
+                .allocate_new_port()
+                .build(),
         });
     }
 
@@ -491,7 +494,10 @@ impl SessionBehaviour {
             return;
         };
         self.queue.push_back(ToSwarm::Dial {
-            opts: DialOpts::unknown_peer_id().address(addr).build(),
+            opts: DialOpts::unknown_peer_id()
+                .address(addr)
+                .allocate_new_port()
+                .build(),
         });
     }
 
@@ -511,8 +517,9 @@ impl SessionBehaviour {
         });
     }
 
-    /// The device id to report for `transport`, if known.
-    fn device_of(&self, transport: &PeerId) -> Option<PeerId> {
+    /// The device id behind `transport`, if known (the reverse of
+    /// [`Self::transport_of`]).
+    pub fn device_of(&self, transport: &PeerId) -> Option<PeerId> {
         self.transport_devices.get(transport).copied()
     }
 

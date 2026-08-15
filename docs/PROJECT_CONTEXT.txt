@@ -38,9 +38,22 @@ MVP-2 progress
     Tests: 4 new unit tests + 1 new integration test
       (address_change_is_republished_and_discovered). Suite now:
       62 unit + 3 integration, all passing.
-  Not yet started: M2.2 dynamic rediscovery (peer side), M2.3 Internet
-    direct, M2.4 NAT traversal, M2.5 relay fallback, M2.6 reconnection,
-    M2.7 hardening.
+  M2.2 - Dynamic rediscovery of stale records (IMPLEMENTED)
+    Peer-side counterpart of M2.1: on session loss the node re-dials
+      the cached address once (2 s) while scheduling a DHT lookup
+      (3 s, 1 s retries, <= 10 attempts). Dial failures invalidate the
+      failed candidates; WrongPeerId invalidates the whole record. A
+      verified record replaces the cache whenever its issued_at is not
+      older (equal timestamps still re-dial, never dropped silently).
+    Dials allocate fresh ephemeral source ports (PortUse::New): on
+      Windows, listener-port reuse for outgoing dials collides with the
+      live listener (WSAEADDRINUSE). A bootstrap_dialing guard prevents
+      duplicate dials to the same address.
+    Tests: 2 new unit tests + 1 new integration test
+      (stale_cached_address_recovers_via_rediscovery). Suite now:
+      66 unit + 4 integration, all passing.
+  Not yet started: M2.3 Internet direct, M2.4 NAT traversal, M2.5 relay
+    fallback, M2.6 reconnection, M2.7 hardening.
   Do NOT mark mailbox/IPFS/Flutter work complete.
 
 What the release includes
@@ -67,10 +80,11 @@ Physical-device validation
 Known limitations (as released / MVP-2 progress)
   - LAN only; no NAT traversal, relay, or Internet connectivity
     (M2.3-M2.5 pending).
-  - Stale DHT addresses after Wi-Fi/network change - PARTIALLY FIXED
-    (M2.1): the node drops addresses whose IP is no longer local and
-    republishes immediately. Peer-side rediscovery of a stale record
-    held remotely is still pending (M2.2).
+  - Stale DHT addresses after Wi-Fi/network change - FIXED (M2.1 + M2.2):
+    the publisher drops addresses whose IP is no longer local and
+    republishes immediately (M2.1); the peer side invalidates failed
+    cached addresses and rediscovers the fresh record via the DHT
+    (M2.2).
   - No offline delivery; no store-and-forward queue.
   - Sending to your own Peer ID hangs awaiting an ack; a send timeout
     is planned (M2.7).

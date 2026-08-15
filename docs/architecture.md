@@ -123,6 +123,37 @@ NewListenAddr / ExpiredListenAddr (libp2p)
   keeps only the newest record per key (same-key replacement), so stale
   addresses disappear from lookups as soon as the new record propagates.
 
+### Address lifecycle (MVP-2 / M2.2): stale-record rediscovery
+
+The M2.1 half keeps the *publisher's* record current. M2.2 handles the
+peer side: a peer holding a *stale* cached record (its dials fail) must
+invalidate it and rediscover the current one.
+
+```
+PeerDisconnected (had_session)
+        ├──> re-dial the cached record once
+        │     └── dial fails  ──> invalidate failed addresses
+        └──> schedule DHT lookup (parallel, 1 s retries, ≤10 attempts)
+              └──> verified record (newer/equal issued_at wins)
+                    └──> dial the fresh addresses  ──> session re-established
+```
+
+- A dial failure (`DialError::Transport`) removes the failed addresses
+  from the cached record; a record with no surviving candidates is
+  dropped. `DialError::WrongPeerId` (the address is live but belongs to
+  a different transport id) invalidates the whole record.
+- The cached re-dial and the DHT lookup run in parallel: the re-dial is
+  the fast path when the address is still valid, the lookup covers the
+  stale case. The verified record replaces the cache whenever its
+  `issued_at` is not older (equal timestamps still trigger a re-dial —
+  a re-fetched record must not be dropped silently).
+- New candidates are dialed with a fresh ephemeral source port
+  (`PortUse::New`): on Windows, reusing the listener port for outgoing
+  dials can collide with the live listener (`WSAEADDRINUSE`).
+- All outgoing dials are guarded (`bootstrap_dialing` set) so the
+  bootstrap loop cannot issue duplicate dials to the same address while
+  one is in flight.
+
 ## 5. Sessions
 
 - One authenticated session per device (`sessions` map in

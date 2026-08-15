@@ -211,6 +211,27 @@ verified record, and the old (stale) address set stops being used once
 the update propagates. There is no record format change — the existing
 `issued_at`/`ttl_secs` freshness rules already express update semantics.
 
+### 5.2 Stale-record handling (MVP-2 / M2.2)
+
+When a session to a peer is lost, the node:
+
+1. Re-dials the cached record once (`RECONNECT_DIAL_DELAY` 2 s). If the
+   dial fails, the failed addresses are dropped from the cached record
+   (`invalidate_candidates`) and, in parallel, a DHT lookup is scheduled
+   (`RECONNECT_DELAY` 3 s).
+2. The lookup is retried every `LOOKUP_RETRY_DELAY` (1 s) up to
+   `MAX_LOOKUP_ATTEMPTS` (10). Verified records replace the cache when
+   their `issued_at` is not older than the cached one (equal timestamps
+   still re-trigger the dial, so a re-fetched record is never dropped
+   silently) and are dialed immediately.
+3. `DialError::WrongPeerId` — the address is live but belongs to a
+   different transport id — invalidates the whole cached record, since
+   the device/transport binding itself is stale.
+
+Dials allocate a fresh ephemeral source port (`PortUse::New`); the
+listener's own port is never reused for outgoing connections, avoiding
+bind collisions (`WSAEADDRINUSE`) on Windows loopback.
+
 ## 6. Connection and session lifecycle
 
 1. A node with no sessions to a peer issues a DHT lookup, verifies the
