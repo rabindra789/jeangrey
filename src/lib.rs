@@ -17,4 +17,4 @@ pub mod storage;
 pub mod transport;
 
 /// Re-exported for API consumers (CLI, tests, and the future client bridge).
-pub use libp2p::Multiaddr;
+pub use libp2p::{Multiaddr, PeerId};

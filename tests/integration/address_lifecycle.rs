@@ -32,6 +32,8 @@ fn node_at(storage: Storage, id: DeviceIdentity, port: u16, bootstrap: Vec<Boots
             listen_port: port,
             bootstrap,
             external_ips: Vec::new(),
+            relay: None,
+            relay_server: false,
         },
     )
     .unwrap()

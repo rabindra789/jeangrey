@@ -43,6 +43,8 @@ fn node_with_ips(
             listen_port: port,
             bootstrap,
             external_ips,
+            relay: None,
+            relay_server: false,
         },
     )
     .unwrap()

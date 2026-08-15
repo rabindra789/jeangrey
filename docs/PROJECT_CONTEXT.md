@@ -89,12 +89,82 @@ is **TBD** (to be decided); the current CLI binary ships as `jeangrey`
   through the advertised address). The loopback test seam
   (`NodeOptions::external_ips`) stands in for a public IP — on Windows
   the loopback source is always observed as 127.0.0.1. Suite now:
-  78 unit + 5 integration, all passing; clippy and fmt clean;
+  78 unit + 6 integration, all passing; clippy and fmt clean;
   aarch64-linux-android check clean.
+
+### M2.4 — NAT traversal / hole punching (implemented)
+
+- **Goal:** direct P2P connectivity for `PC behind home NAT ↔ phone on
+  mobile CGNAT` with no manual port forwarding, no manual public IPs.
+  Reuse libp2p's mature mechanisms; do not invent a custom traversal
+  protocol. M2.5 relay fallback stays out of scope (libp2p circuit relay
+  is used only as the traversal coordination path the DCUtR spec
+  requires).
+- **libp2p baseline:** 0.54.1. New features enabled: `identify`,
+  `autonat`, `dcutr`, `relay` (crates libp2p-identify 0.45.0,
+  libp2p-autonat 0.13.0, libp2p-dcutr 0.12.0, libp2p-relay 0.18.0).
+- **Mechanism (libp2p DCUtR):** both peers are connected through a
+  circuit-relay v2 relay; the DCUtR behaviour exchanges observed address
+  candidates over the relayed connection, then both sides simultaneously
+  dial the candidate they observed for the peer; if the NATs permit, a
+  direct connection replaces the relayed one. The JeanGrey secure
+  session then runs over the new direct transport (fresh ML-KEM).
+- **Architecture decisions:**
+  - `NodeOptions { relay: Option<BootstrapPeer>, relay_server: bool }`;
+    CLI `--relay PEERID@/ip4/.../tcp/PORT` (traversal coordination
+    relay) and `--relay-server` (host a relay; useful for tests/VPS).
+  - Relay client transport (`relay::client::new`) chained with the
+    upgraded TCP transport via `OrTransport`; listen on
+    `<relay-addr>/p2p/<relay-id>/p2p-circuit` reserves the circuit and
+    yields `/p2p/<relay-id>/p2p-circuit` as a listen address that is
+    advertised in the signed DHT record (so NAT'd peers are reachable
+    for traversal coordination).
+  - `identify` + `autonat` run on every node: observed addresses feed
+    DCUtR candidates; `[nat] reachability=...` status is logged.
+  - Connection path is tracked per peer (Disconnected/Connecting/
+    Direct/Relayed/Traversing/Failed) and surfaced in the `peers` CLI
+    listing; `[nat]`/`[connect]`-prefixed logs report transitions.
+  - Direct path always wins: records are dialed address-by-address
+    (direct first; circuit addresses are dialed only when direct fails).
+  - DCUtR is attempted automatically on every relayed connection; our
+    node tracks bounded per-peer traversal attempts (max 3, logged) —
+    libp2p-dcutr 0.12 has no external config surface.
+  - The M2.3 ObservedAddr frame is kept unchanged; DCUtR consumes the
+    swarm's observed-address candidates (from identify), so no protocol
+    change is needed to feed traversal.
+  - Security boundary: traversal only changes the transport path; the
+    JeanGrey ML-DSA + fresh ML-KEM + HKDF + AEAD session layer is
+    untouched. A traversal success creates a brand-new connection and a
+    fresh handshake/session (no session reuse across transports).
+- **Tests:** unit — path-state transitions, traversal attempt/backoff
+  budget, relayed-candidate handling. Integration —
+  `nat_traversal_relayed_session_punch_and_round_trip` (three nodes on
+  loopback: relay server R + peers A/B reserving circuits through R;
+  A dials B via the circuit; DCUtR upgrades to a direct connection; a
+  fresh session re-establishes and a message round-trips with an
+  authenticated ACK). Two test-harness bugs were found and fixed while
+  getting this test green (details in `docs/testing.md`): the relayed
+  path starves unless BOTH nodes stay polled (a test that polls A only
+  misses the relay's handshake frames to B, the 30 s handshake timeout
+  closes the circuit, and A's pending dial dies) — fixed with
+  `Node::next_event` + a `wait_for_pair` select-poller; and on loopback
+  the punch beats the handshake, so the via-relay observation runs
+  concurrently with the session wait (path map re-checked after every
+  event). The test asserts the path map shows `Direct`, reachable only
+  via the punch because the test dials only the circuit address. Real-
+  network tests remain on the roadmap (same-LAN regression;
+  cross-network with/without port forward).
+- **Known limitations (expected):** DCUtR succeeds only on NAT
+  topologies that permit simultaneous dials (cone/port-restricted-cone
+  with port reuse, etc.); symmetric NATs will fail → M2.5 relay. On
+  Windows, outbound dials keep fresh source ports (M2.2
+  WSAEADDRINUSE fix), which reduces punch success on port-restricted
+  cones; `tcp::Config::port_reuse` remains disabled by default.
+  AutoNAT only reports reachability when other autonat-capable peers
+  probe us.
 
 ### Not yet started (MVP-2 remaining)
 
-- M2.4 NAT traversal
 - M2.5 relay fallback
 - M2.6 reconnection
 - M2.7 hardening (timeouts, retry/backoff, state machine, CLI diagnostics)
@@ -125,11 +195,14 @@ out of scope per `docs/PROJECT_CONTEXT.md` (see below).
 
 ## Known limitations (as released / MVP-2 progress)
 
-- **NAT traversal / relay not implemented (M2.4–M2.5 pending).** Nodes
-  on the same LAN or with directly reachable public addresses connect
-  directly; discovery via observed addresses (M2.3) helps nodes behind
-  NAT advertise their public endpoint, but no hole punching or relay
-  fallback exists yet.
+- **NAT traversal — IMPLEMENTED (M2.4), relay fallback pending (M2.5).**
+  Nodes behind NAT reach each other over a circuit-relay v2 path and
+  DCUtR hole punching upgrades it to a direct connection when the NAT
+  topology permits (cone/port-restricted-cone); symmetric NATs and
+  Windows source-port constraints can still fail the punch (see M2.4
+  known limitations). There is no store-and-forward relay fallback yet:
+  without a successful punch, a relayed connection still carries the
+  session, but only while the relay is reachable.
 - **Stale DHT addresses after Wi-Fi/network change — FIXED (M2.1 + M2.2).**
   The publisher drops addresses whose IP is no longer local and
   republishes immediately (M2.1); the peer side invalidates failed
@@ -155,7 +228,8 @@ out of scope per `docs/PROJECT_CONTEXT.md` (see below).
 
 ## Out of scope (future phases, NOT claimed in v1.0.120)
 
-- Internet-wide connectivity, NAT traversal, hole punching, relay fallback
+- Internet-wide connectivity (guaranteed reachability via relay
+  fallback — M2.5), store-and-forward relay
 - offline mailbox / store-and-forward
 - IPFS media distribution
 - multi-device account synchronization

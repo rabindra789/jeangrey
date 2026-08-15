@@ -72,8 +72,47 @@ MVP-2 progress
       public IP — on Windows the loopback source is always seen as
       127.0.0.1. Suite now: 78 unit + 5 integration, all passing;
       clippy/fmt clean; aarch64-linux-android check clean.
-  Not yet started: M2.4 NAT traversal, M2.5 relay fallback, M2.6
-    reconnection, M2.7 hardening.
+  M2.4 - NAT traversal / hole punching (IMPLEMENTED)
+    Mechanism (libp2p DCUtR 0.12 + circuit relay v2 0.18, libp2p 0.54.1):
+      both peers reserve circuits through a relay server; a relayed
+      connection carries the session while DCUtR exchanges observed
+      address candidates (from identify) over it; both sides then
+      simultaneously dial the observed candidate; if the NATs permit, a
+      direct connection replaces the relayed one and a fresh JeanGrey
+      session (ML-DSA + ML-KEM, no reuse across transports) runs over it.
+    NodeOptions { relay, relay_server }; CLI --relay PEERID@addr and
+      --relay-server. Relay client transport chained via OrTransport;
+      listening on <relay>/p2p-circuit yields a circuit address advertised
+      in the signed DHT record.
+    Connection path tracked per peer (Disconnected/Connecting/Direct/
+      Relayed/Traversing/Failed), surfaced in the peers listing and
+      [nat]/[connect] logs. Direct addresses dialed before circuit
+      addresses. DCUtR punches automatically on every relayed connection;
+      bounded per-peer traversal attempts (max 3), then the relayed path
+      stays.
+    Tests: unit (path states, traversal budget) + 1 new integration test
+      (nat_traversal_relayed_session_punch_and_round_trip): relay R at
+      9261, A at 9262, B at 9263; A dials B via the circuit; DCUtR
+      punches to direct; fresh session; message + authenticated ack.
+      Runtime ~2 s. Two test-harness bugs fixed while getting it green:
+      (1) the relayed path starves unless BOTH nodes stay polled (only-A
+      polling misses the relay's handshake frames to B; the 30 s
+      handshake timeout closes the circuit; A's pending dial dies with
+      "unexpected end of file") — fixed with Node::next_event + a
+      wait_for_pair select-poller; (2) on loopback the punch (~110 ms
+      after the relayed connection) beats the ML-KEM/ML-DSA handshake,
+      so the via-relay path observation runs concurrently with the
+      session wait (path map re-checked after every event). Suite now:
+      78 unit + 6 integration, all passing; clippy/fmt clean.
+    Known limitations: punch succeeds only on NAT topologies permitting
+      simultaneous dials (symmetric NATs fail -> M2.5 relay); Windows
+      keeps fresh source ports for outbound dials (M2.2 WSAEADDRINUSE
+      fix), reducing punch success on port-restricted cones (one side's
+      punch can fail with os error 10048 while the other side's punch
+      still establishes the direct connection); AutoNAT only reports
+      reachability when other autonat-capable peers probe us.
+  Not yet started: M2.5 relay fallback, M2.6 reconnection, M2.7
+    hardening.
   Do NOT mark mailbox/IPFS/Flutter work complete.
 
 What the release includes
@@ -98,10 +137,14 @@ Physical-device validation
   - Full annotated logs: docs/testing.md
 
 Known limitations (as released / MVP-2 progress)
-  - NAT traversal / relay not implemented (M2.4-M2.5 pending): nodes on
-    the same LAN or with directly reachable public addresses connect
-    directly; observed-address discovery (M2.3) helps advertise a public
-    endpoint behind NAT, but no hole punching or relay fallback yet.
+  - NAT traversal - IMPLEMENTED (M2.4); relay fallback pending (M2.5):
+    nodes behind NAT reach each other over a circuit-relay v2 path and
+    DCUtR hole punching upgrades it to a direct connection when the NAT
+    topology permits (cone/port-restricted-cone); symmetric NATs and
+    Windows source-port constraints can still fail the punch. Without a
+    successful punch, a relayed connection still carries the session,
+    but only while the relay is reachable; no store-and-forward relay
+    fallback yet.
   - Stale DHT addresses after Wi-Fi/network change - FIXED (M2.1 + M2.2):
     the publisher drops addresses whose IP is no longer local and
     republishes immediately (M2.1); the peer side invalidates failed
@@ -123,8 +166,9 @@ Build notes
     Termux only, not a standalone Android app
   - Android cargo linker config lives in ~/.cargo/config.toml (user-local)
 
-Out of scope (future phases, NOT claimed in v1.0.120)
-  - Internet-wide connectivity, NAT traversal, hole punching, relay
+Out of scope (future phases, NOT claimed in v1.1.121)
+  - Internet-wide connectivity (guaranteed reachability via relay
+    fallback - M2.5), store-and-forward relay
   - offline mailbox / store-and-forward
   - IPFS media distribution
   - multi-device account synchronization

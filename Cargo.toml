@@ -17,6 +17,10 @@ libp2p = { version = "0.54", default-features = false, features = [
     "plaintext",
     "kad",
     "macros",
+    "autonat",
+    "dcutr",
+    "identify",
+    "relay",
 ] }
 ml-kem = "0.2"
 ml-dsa = { version = "0.1", features = ["rand_core"] }

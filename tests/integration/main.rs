@@ -2,6 +2,7 @@
 
 mod address_lifecycle;
 mod messaging;
+mod nat_traversal;
 mod persistence;
 mod public_address_discovery;
 mod stale_rediscovery;

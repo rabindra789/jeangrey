@@ -52,6 +52,14 @@ pub struct Common {
     /// Bootstrap peer as PEERID@/ip4/.../tcp/PORT (repeatable).
     #[arg(long = "bootstrap")]
     pub bootstrap: Vec<String>,
+    /// Circuit relay v2 server for NAT traversal coordination as
+    /// PEERID@/ip4/.../tcp/PORT (M2.4). Both peers must share a relay.
+    #[arg(long = "relay")]
+    pub relay: Vec<String>,
+    /// Serve as a circuit relay v2 server (M2.4). Requires a publicly
+    /// reachable address.
+    #[arg(long = "relay-server")]
+    pub relay_server: bool,
 }
 
 #[derive(Subcommand)]
@@ -110,10 +118,16 @@ fn build_options(common: &Common) -> Result<NodeOptions> {
     for s in &common.bootstrap {
         bootstrap.push(BootstrapPeer::parse(s).map_err(anyhow::Error::msg)?);
     }
+    let mut relay = None;
+    for s in &common.relay {
+        relay = Some(BootstrapPeer::parse(s).map_err(anyhow::Error::msg)?);
+    }
     Ok(NodeOptions {
         listen_port,
         bootstrap,
         external_ips: Vec::new(),
+        relay,
+        relay_server: common.relay_server,
     })
 }
 
@@ -213,9 +227,9 @@ async fn cmd_node(common: &Common) -> Result<()> {
                             println!("no sessions established yet");
                         }
                         Ok(peers) => {
-                            println!("established sessions:");
-                            for (name, peer) in peers {
-                                println!("  {name}  {peer}");
+                            println!("established sessions (path):");
+                            for (name, peer, path) in peers {
+                                println!("  {name}  {peer}  [{path}]");
                             }
                         }
                         Err(_) => println!("node went away"),
@@ -355,12 +369,28 @@ async fn cmd_peers(common: &Common) -> Result<()> {
     let mut node = new_node(common)?;
     println!("discovering peers for {}s...", PEERS_RUN.as_secs());
     node.run_for(PEERS_RUN).await;
+    // M2.4: report AutoNAT reachability when known.
+    println!(
+        "nat reachability: {}",
+        match node.nat_status() {
+            "public" => "public (directly reachable)",
+            "private" => "private (behind NAT)",
+            _ => "unknown (no probes yet)",
+        }
+    );
+    if node.serves_relay() {
+        println!("this node serves circuit relay reservations");
+    }
     let connected = node.connected_peers();
     if !connected.is_empty() {
-        println!("connected (transport level):");
+        println!("connected peers (path):");
+        let paths = node.peer_paths();
         for p in connected {
-            println!("  {}", short_id(&p));
+            let path = paths.get(&p).map(|x| x.label()).unwrap_or("unknown");
+            println!("  {}  [{path}]", short_id(&p));
         }
+    } else {
+        println!("no peers connected");
     }
     let sessions = node.session_peers();
     if sessions.is_empty() {

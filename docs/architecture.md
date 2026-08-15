@@ -199,6 +199,49 @@ inbound connection (Listener side)
 - Validated addresses are merged into the signed record at publish time
   (M2.1 integration) and are advertised alongside the local addresses.
 
+### Address lifecycle (MVP-2 / M2.4): NAT traversal
+
+Two NAT'd peers cannot dial each other directly; M2.4 gives them a
+traversal path using libp2p circuit relay v2 + DCUtR. The relayed path
+provides connectivity *during* traversal coordination; the hole punch
+tries to replace it with a direct connection.
+
+```
+relay server R (--relay-server)
+   A ── direct ──> R ── direct <── B          (both reserve circuits)
+   A ── p2p-circuit ──> B                     (dial via /p2p/R/p2p-circuit/p2p/B)
+   DCUtR over the relayed connection exchanges observed addrs
+   A ──direct punch──> B and B ──direct punch──> A   (simultaneous dials)
+   relayed connection replaced; fresh JeanGrey session over the direct path
+```
+
+- `NodeOptions { relay: Option<BootstrapPeer>, relay_server: bool }`;
+  `--relay PEERID@addr` names the coordination relay, `--relay-server`
+  hosts one (listening for `p2p-circuit` on its own listen port).
+- The relay client transport (`relay::client::new`) is chained with the
+  upgraded TCP transport via `OrTransport`; dialing
+  `<relay-addr>/p2p/<relay-id>/p2p-circuit` reserves a circuit and yields
+  `/p2p/<relay-id>/p2p-circuit` as a listen address, advertised in the
+  signed DHT record (so peers can reach us for traversal coordination).
+  The relay transport must stay in the chain or libp2p panics when the
+  reservation is created.
+- `identify` + `autonat` run on every node: identify's observed addresses
+  feed DCUtR candidates; autonat reports `[nat] reachability=...`.
+- The connection path is tracked per peer (Disconnected/Connecting/
+  Direct/Relayed/Traversing/Failed) and surfaced in the `peers` CLI
+  listing and `[connect]`/`[nat]` logs.
+- Direct addresses are dialed before circuit addresses (direct path
+  wins); circuit addresses are dialed only when direct dialing failed.
+- DCUtR is attempted automatically on every relayed connection
+  (libp2p-dcutr 0.12 has no external config surface); our node tracks
+  bounded per-peer traversal attempts (max 3) and falls back to the
+  relayed path when the budget is spent.
+- Security boundary: traversal only changes the transport path. A
+  traversal success creates a brand-new connection that re-runs the
+  full ML-DSA + ML-KEM handshake; sessions are never reused across
+  transports, and the relay never sees plaintext (the relayed
+  connection still carries the AEAD-encrypted session stream).
+
 ## 5. Sessions
 
 - One authenticated session per device (`sessions` map in

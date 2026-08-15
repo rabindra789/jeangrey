@@ -34,7 +34,7 @@ use futures::future::Ready;
 use futures::io::{AsyncRead, AsyncWrite};
 use futures::ready;
 use libp2p::core::upgrade::{InboundUpgrade, OutboundUpgrade, UpgradeInfo};
-use libp2p::swarm::dial_opts::DialOpts;
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::swarm::handler::{
     ConnectionEvent, ConnectionHandler, ConnectionHandlerEvent, SubstreamProtocol,
 };
@@ -501,6 +501,14 @@ impl SessionBehaviour {
         self.queue.push_back(ToSwarm::Dial {
             opts: DialOpts::peer_id(transport)
                 .addresses(addrs)
+                // M2.4: reconnect dials must never be cancelled by an
+                // unrelated in-flight dial to the same transport peer (e.g.
+                // a stale routing-table address dialed by the kad query):
+                // `DisconnectedAndNotDialing` would silently drop the fresh
+                // verified record's dial and the reconnect would never
+                // happen. `Always` lets it proceed; the jeangrey `dialing`
+                // guard and session dedup still bound the attempts.
+                .condition(PeerCondition::Always)
                 .allocate_new_port()
                 .build(),
         });
@@ -872,6 +880,7 @@ impl NetworkBehaviour for SessionBehaviour {
                     ));
                 }
             }
+            FromSwarm::DialFailure(_) => {}
             _ => {}
         }
     }

@@ -1,8 +1,12 @@
 //! The JeanGrey node: swarm assembly, DHT discovery, and the event loop.
 //!
-//! Composition: `NodeBehaviour = SessionBehaviour + kad::Behaviour`. The
-//! Kademlia DHT is used strictly for discovery of address records; all
-//! application data is exchanged over authenticated JeanGrey sessions.
+//! Composition: `NodeBehaviour = SessionBehaviour + kad::Behaviour +
+//! identify + autonat + dcutr + relay`. The Kademlia DHT is used strictly
+//! for discovery of address records; all application data is exchanged over
+//! authenticated JeanGrey sessions. M2.4 adds libp2p NAT traversal
+//! (AutoNAT for reachability status, circuit relay v2 for traversal
+//! coordination, DCUtR for hole punching); the relayed path is only a
+//! coordination channel for DCUtR, never a user-facing fallback.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
@@ -13,8 +17,9 @@ use futures::StreamExt;
 use libp2p::core::upgrade::Version;
 use libp2p::kad::store::MemoryStore;
 use libp2p::kad::{self, QueryId, RecordKey};
+use libp2p::multiaddr::Protocol;
 use libp2p::swarm::{Config as SwarmConfig, DialError, NetworkBehaviour, Swarm, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, Transport as _};
+use libp2p::{autonat, dcutr, identify, relay, Multiaddr, PeerId, Transport as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -27,6 +32,12 @@ pub use crate::transport::BehaviourEvent;
 
 /// JeanGrey Kademlia protocol name (distinct from the transport protocol).
 pub const KAD_PROTOCOL: &str = "/jeangrey/kad/1.0.0";
+/// Identify protocol version string (M2.4).
+pub const IDENTIFY_PROTOCOL: &str = "/jeangrey/identify/1.0.0";
+/// Maximum DCUtR traversal attempts per relayed connection before the peer
+/// stays on the relayed path (M2.4; libp2p-dcutr bounds its own internal
+/// retries, this bounds our bookkeeping/state machine).
+pub const MAX_TRAVERSAL_ATTEMPTS: u32 = 3;
 /// How often our address record is re-published into the DHT.
 pub const PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
 /// How often the local interface set is re-enumerated to detect stale
@@ -61,6 +72,16 @@ pub struct NodeBehaviour {
     pub session: SessionBehaviour,
     /// Kademlia DHT for discovery.
     pub kad: kad::Behaviour<MemoryStore>,
+    /// Identify: observed-address reporting (feeds DCUtR candidates).
+    pub identify: identify::Behaviour,
+    /// AutoNAT: reports whether this node is publicly reachable.
+    pub autonat: autonat::Behaviour,
+    /// DCUtR: hole punches relayed connections into direct ones.
+    pub dcutr: dcutr::Behaviour,
+    /// Circuit relay v2 client (traversal coordination).
+    pub relay_client: relay::client::Behaviour,
+    /// Circuit relay v2 server (only serves when explicitly enabled).
+    pub relay_server: relay::Behaviour,
 }
 
 /// Events produced by the composed behaviour.
@@ -68,6 +89,11 @@ pub struct NodeBehaviour {
 pub enum NodeEvent {
     Session(BehaviourEvent),
     Kad(kad::Event),
+    Identify(identify::Event),
+    Autonat(autonat::Event),
+    Dcutr(dcutr::Event),
+    RelayClient(relay::client::Event),
+    RelayServer(relay::Event),
 }
 
 impl From<BehaviourEvent> for NodeEvent {
@@ -79,6 +105,36 @@ impl From<BehaviourEvent> for NodeEvent {
 impl From<kad::Event> for NodeEvent {
     fn from(e: kad::Event) -> Self {
         NodeEvent::Kad(e)
+    }
+}
+
+impl From<identify::Event> for NodeEvent {
+    fn from(e: identify::Event) -> Self {
+        NodeEvent::Identify(e)
+    }
+}
+
+impl From<autonat::Event> for NodeEvent {
+    fn from(e: autonat::Event) -> Self {
+        NodeEvent::Autonat(e)
+    }
+}
+
+impl From<dcutr::Event> for NodeEvent {
+    fn from(e: dcutr::Event) -> Self {
+        NodeEvent::Dcutr(e)
+    }
+}
+
+impl From<relay::client::Event> for NodeEvent {
+    fn from(e: relay::client::Event) -> Self {
+        NodeEvent::RelayClient(e)
+    }
+}
+
+impl From<relay::Event> for NodeEvent {
+    fn from(e: relay::Event) -> Self {
+        NodeEvent::RelayServer(e)
     }
 }
 
@@ -123,6 +179,45 @@ pub struct NodeOptions {
     /// IPs to treat as external even when they look local (loopback test
     /// seam; empty in production).
     pub external_ips: Vec<IpAddr>,
+    /// Circuit relay v2 server to use for NAT traversal coordination
+    /// (M2.4). The node reserves a relayed address on it and DCUtR punches
+    /// through to a direct connection.
+    pub relay: Option<BootstrapPeer>,
+    /// Serve as a circuit relay v2 server (M2.4). Only reachable when this
+    /// node has a public address.
+    pub relay_server: bool,
+}
+
+/// The transport path used to reach a peer (M2.4), as surfaced in the
+/// `peers` CLI listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerPath {
+    /// No connection to the peer.
+    Disconnected,
+    /// A connection attempt is in flight.
+    Connecting,
+    /// Connected over a direct (non-relayed) transport.
+    Direct,
+    /// Connected through a circuit relay (DCUtR coordination in progress).
+    Relayed,
+    /// DCUtR hole punching is in flight.
+    Traversing,
+    /// The last traversal attempt failed; reconnect is being scheduled.
+    Failed,
+}
+
+impl PeerPath {
+    /// The stable label shown to users in CLI output.
+    pub fn label(&self) -> &'static str {
+        match self {
+            PeerPath::Disconnected => "disconnected",
+            PeerPath::Connecting => "connecting",
+            PeerPath::Direct => "direct",
+            PeerPath::Relayed => "via-relay",
+            PeerPath::Traversing => "traversing",
+            PeerPath::Failed => "failed",
+        }
+    }
 }
 
 /// One in-flight discovery lookup.
@@ -177,8 +272,10 @@ struct PendingProbe {
 
 /// Filter `addrs` down to the addresses whose IP is still configured on a
 /// local interface. Loopback addresses are always accepted (they cannot go
-/// stale); addresses without an IP protocol component are dropped; the
-/// order of the surviving addresses is preserved and duplicates removed.
+/// stale); addresses without an IP protocol component are dropped, EXCEPT
+/// relayed (`/p2p-circuit`) addresses, which are reachable through the
+/// relay regardless of local interface state (M2.4); the order of the
+/// surviving addresses is preserved and duplicates removed.
 ///
 /// This is the core of the address-lifecycle fix: libp2p does not expire a
 /// wildcard listener's per-interface addresses when the underlying network
@@ -196,9 +293,13 @@ pub fn filter_local_addrs(
             libp2p::multiaddr::Protocol::Ip6(i) => Some(IpAddr::V6(i)),
             _ => None,
         });
+        let is_relayed = a
+            .iter()
+            .any(|p| p == libp2p::multiaddr::Protocol::P2pCircuit);
         let keep = match ip {
             Some(ip) if ip.is_loopback() => true,
             Some(ip) => local_ips.contains(&ip),
+            None if is_relayed => true,
             None => false,
         };
         if keep && seen.insert(a.to_string()) {
@@ -269,6 +370,24 @@ pub struct Node {
     listen_port: u16,
     /// IPs to treat as external even when they look local (test seam).
     external_ips: Vec<IpAddr>,
+    /// Circuit relay server used for NAT traversal coordination (M2.4).
+    relay: Option<BootstrapPeer>,
+    /// Whether this node serves circuit relay reservations (M2.4).
+    relay_server: bool,
+    /// Transport Peer ID of the coordination relay, resolved from a
+    /// peerless dial (M2.4). libp2p addresses the relay by its transport
+    /// id; the CLI gives the device id, so it must be learned.
+    relay_transport: Option<PeerId>,
+    /// A peerless dial to the relay is in flight (dedup guard).
+    relay_dialing: bool,
+    /// Transport path per connected peer (M2.4); keyed by transport Peer ID.
+    peer_paths: HashMap<PeerId, PeerPath>,
+    /// Bounded per-peer DCUtR traversal budget (M2.4): a traversal is
+    /// attempted at most [`MAX_TRAVERSAL_ATTEMPTS`] times per relayed
+    /// connection before the peer is left on the relayed path.
+    traversal_attempts: HashMap<PeerId, u32>,
+    /// Latest AutoNAT status ("public"/"private"/"unknown"), for reporting.
+    nat_status: String,
 }
 
 impl Node {
@@ -278,15 +397,24 @@ impl Node {
         options: NodeOptions,
     ) -> Result<Self, NodeError> {
         let identity = Arc::new(identity);
+        let transport_peer_id = identity.transport_peer_id();
 
         // Transport: TCP + plaintext (the JeanGrey layer provides all real
-        // authentication) + yamux multiplexing.
+        // authentication) + yamux multiplexing, with the circuit relay v2
+        // client transport as a fallback for `/p2p-circuit` addresses
+        // (M2.4): relayed connections are used only as the DCUtR
+        // coordination channel. The upgrade chain applies to both arms, so
+        // relayed connections get the same authentication + multiplexing
+        // as direct ones.
         let transport =
-            libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::new().nodelay(true))
-                .upgrade(Version::V1)
-                .authenticate(libp2p::plaintext::Config::new(&identity.transport_keypair))
-                .multiplex(libp2p::yamux::Config::default())
-                .boxed();
+            libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::new().nodelay(true));
+        let (relay_transport, relay_client) = relay::client::new(transport_peer_id);
+        let transport = transport
+            .or_transport(relay_transport)
+            .upgrade(Version::V1)
+            .authenticate(libp2p::plaintext::Config::new(&identity.transport_keypair))
+            .multiplex(libp2p::yamux::Config::default())
+            .boxed();
 
         let session = SessionBehaviour::new(identity.clone());
         let mut kad_config = kad::Config::new(libp2p::swarm::StreamProtocol::new(KAD_PROTOCOL));
@@ -295,7 +423,6 @@ impl Node {
         // the swarm local id to match the plaintext signing keypair). The
         // device Peer ID remains the identity users address; the signed
         // address record binds the two.
-        let transport_peer_id = identity.transport_peer_id();
         let mut kad = kad::Behaviour::with_config(
             transport_peer_id,
             MemoryStore::new(transport_peer_id),
@@ -305,7 +432,26 @@ impl Node {
         // which denies inbound kad substreams until an external address is
         // confirmed — that never happens on a LAN, leaving the DHT dead.
         kad.set_mode(Some(kad::Mode::Server));
-        let behaviour = NodeBehaviour { session, kad };
+        // M2.4: identify reports the observed address of every connection
+        // (feeding DCUtR's candidate set); autonat probes our reachability;
+        // dcutr punches relayed connections to direct ones; the relay
+        // client/server behaviours manage circuit reservations.
+        let identify = identify::Behaviour::new(identify::Config::new(
+            IDENTIFY_PROTOCOL.to_string(),
+            identity.transport_keypair.public(),
+        ));
+        let autonat = autonat::Behaviour::new(transport_peer_id, autonat::Config::default());
+        let dcutr = dcutr::Behaviour::new(transport_peer_id);
+        let relay_server = relay::Behaviour::new(transport_peer_id, relay::Config::default());
+        let behaviour = NodeBehaviour {
+            session,
+            kad,
+            identify,
+            autonat,
+            dcutr,
+            relay_client,
+            relay_server,
+        };
         let mut swarm = Swarm::new(
             transport,
             behaviour,
@@ -322,6 +468,11 @@ impl Node {
             .listen_on(listen_addr)
             .map_err(|e| NodeError::Listen(e.to_string()))?;
 
+        // M2.4: the coordination relay is addressed by its *transport*
+        // Peer ID at the libp2p layer, but the CLI/bootstrap record only
+        // carries the device id. The transport id is resolved by dialing
+        // the relay peerless; the reservation (circuit listen) is issued
+        // once the connection reveals it (see `handle_event`).
         // Bootstrap peers are dialed with unknown transport Peer ID; the
         // transport id is learned when the connection establishes (the
         // device/transport binding is then recorded and the DHT is seeded).
@@ -355,6 +506,13 @@ impl Node {
             pending_probes: HashMap::new(),
             listen_port: options.listen_port,
             external_ips: options.external_ips,
+            relay: options.relay,
+            relay_server: options.relay_server,
+            relay_transport: None,
+            relay_dialing: false,
+            peer_paths: HashMap::new(),
+            traversal_attempts: HashMap::new(),
+            nat_status: "unknown".to_string(),
         };
         Ok(node)
     }
@@ -500,6 +658,28 @@ impl Node {
     /// Connected peers (transport level).
     pub fn connected_peers(&self) -> Vec<PeerId> {
         self.swarm.connected_peers().copied().collect()
+    }
+
+    /// Transport path per peer (M2.4); keyed by transport Peer ID.
+    pub fn peer_paths(&self) -> &HashMap<PeerId, PeerPath> {
+        &self.peer_paths
+    }
+
+    /// Latest AutoNAT reachability status: "public", "private" or
+    /// "unknown" (M2.4).
+    pub fn nat_status(&self) -> &str {
+        &self.nat_status
+    }
+
+    /// Whether this node serves circuit relay reservations (M2.4).
+    pub fn serves_relay(&self) -> bool {
+        self.relay_server
+    }
+
+    /// The circuit relay server this node uses for traversal coordination
+    /// (M2.4).
+    pub fn relay_server_of(&self) -> Option<&BootstrapPeer> {
+        self.relay.as_ref()
     }
 
     /// Dial a device directly. `transport` is the device's libp2p transport
@@ -1206,6 +1386,24 @@ impl Node {
                 }
             }
         }
+        // M2.4: resolve the coordination relay's transport Peer ID with a
+        // peerless dial, then reserve the relayed (circuit) listen address.
+        // Re-attempted on failure by the dial-failed handler clearing
+        // `relay_dialing`.
+        if self.relay_transport.is_none() && !self.relay_dialing {
+            if let Some(relay_bp) = &self.relay {
+                self.relay_dialing = true;
+                tracing::debug!(
+                    node = %self.identity.user.user_name,
+                    relay = %short_id(&relay_bp.peer_id()),
+                    "dialing relay to resolve its transport id"
+                );
+                self.swarm
+                    .behaviour_mut()
+                    .session
+                    .connect_unknown(relay_bp.multiaddrs());
+            }
+        }
     }
 
     /// Handle one swarm event; returns the session event if there was one.
@@ -1216,8 +1414,119 @@ impl Node {
                 self.on_kad_event(ev);
                 None
             }
+            SwarmEvent::Behaviour(NodeEvent::Identify(ev)) => {
+                if let identify::Event::Received { peer_id, info, .. } = ev {
+                    // M2.4: the observed address is the seed for hole
+                    // punching; log it (never keys/secrets).
+                    tracing::debug!(
+                        node = %self.identity.user.user_name,
+                        peer = %short_id(&peer_id),
+                        observed = %info.observed_addr,
+                        "identified peer"
+                    );
+                }
+                None
+            }
+            SwarmEvent::Behaviour(NodeEvent::Autonat(ev)) => {
+                if let autonat::Event::StatusChanged { new, .. } = ev {
+                    let status = match new {
+                        autonat::NatStatus::Public(_) => "public",
+                        autonat::NatStatus::Private => "private",
+                        autonat::NatStatus::Unknown => "unknown",
+                    };
+                    self.nat_status = status.to_string();
+                    tracing::info!(
+                        node = %self.identity.user.user_name,
+                        reachability = status,
+                        "nat reachability changed"
+                    );
+                }
+                None
+            }
+            SwarmEvent::Behaviour(NodeEvent::Dcutr(ev)) => {
+                let dcutr::Event {
+                    remote_peer_id,
+                    result,
+                } = ev;
+                match result {
+                    Ok(_conn_id) => {
+                        // M2.4: hole punch succeeded. The new direct
+                        // connection re-runs the JeanGrey handshake
+                        // (fresh ML-KEM session); the relayed
+                        // connection is dropped by libp2p (DCUtR closes
+                        // it once the direct one is established).
+                        let attempts = self.traversal_attempts.remove(&remote_peer_id);
+                        if attempts.is_none() {
+                            self.peer_paths.insert(remote_peer_id, PeerPath::Direct);
+                        }
+                        tracing::info!(
+                            node = %self.identity.user.user_name,
+                            peer = %short_id(&remote_peer_id),
+                            "nat traversal succeeded; direct connection established"
+                        );
+                    }
+                    Err(error) => {
+                        // M2.4: traversal failed for this relayed
+                        // connection; bounded retries, then the peer
+                        // stays on the relayed path.
+                        let attempts = self.traversal_attempts.entry(remote_peer_id).or_insert(0);
+                        *attempts += 1;
+                        if *attempts >= MAX_TRAVERSAL_ATTEMPTS {
+                            self.traversal_attempts.remove(&remote_peer_id);
+                            self.peer_paths.insert(remote_peer_id, PeerPath::Failed);
+                            tracing::warn!(
+                                node = %self.identity.user.user_name,
+                                peer = %short_id(&remote_peer_id),
+                                attempts = MAX_TRAVERSAL_ATTEMPTS,
+                                error = %error,
+                                "nat traversal failed; staying on relayed path"
+                            );
+                        } else {
+                            tracing::info!(
+                                node = %self.identity.user.user_name,
+                                peer = %short_id(&remote_peer_id),
+                                attempts = *attempts,
+                                "nat traversal failed; retrying"
+                            );
+                        }
+                    }
+                }
+                None
+            }
+            SwarmEvent::Behaviour(NodeEvent::RelayClient(ev)) => {
+                if let relay::client::Event::ReservationReqAccepted {
+                    relay_peer_id,
+                    limit,
+                    ..
+                } = ev
+                {
+                    tracing::info!(
+                        node = %self.identity.user.user_name,
+                        relay = %short_id(&relay_peer_id),
+                        limit = ?limit,
+                        "relayed address reserved"
+                    );
+                }
+                None
+            }
+            SwarmEvent::Behaviour(NodeEvent::RelayServer(ev)) => {
+                if let relay::Event::ReservationReqAccepted { .. } = ev {
+                    tracing::info!(
+                        node = %self.identity.user.user_name,
+                        "relay reservation served"
+                    );
+                }
+                None
+            }
             SwarmEvent::NewListenAddr { address, .. } => {
                 tracing::info!(node = %self.identity.user.user_name, %address, "listening");
+                if self.relay_server {
+                    // A circuit relay must publish its own addresses in
+                    // reservation responses, or clients reject them with
+                    // `NoAddressesInReservation` and no circuit listen
+                    // address ever materialises.
+                    self.swarm.add_external_address(address.clone());
+                }
                 if self.note_listen_addr(address) {
                     self.publish_record();
                 }
@@ -1236,6 +1545,45 @@ impl Node {
                 connection_id,
                 ..
             } => {
+                // M2.4: a peerless dial to the coordination relay resolves
+                // its transport Peer ID, enabling the circuit reservation
+                // (the reservation address must carry the transport id, not
+                // the device id, or every relay dial fails with
+                // `UnexpectedPeerId`).
+                if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
+                    if self.relay_transport.is_none() {
+                        if let Some(relay_bp) = &self.relay {
+                            if relay_bp.multiaddrs().iter().any(|a| a == address) {
+                                self.relay_transport = Some(peer_id);
+                                self.relay_dialing = false;
+                                self.swarm
+                                    .behaviour_mut()
+                                    .session
+                                    .map_transport(relay_bp.peer_id(), peer_id);
+                                for addr in relay_bp.multiaddrs() {
+                                    let circuit_listen = addr
+                                        .with(Protocol::P2p(peer_id))
+                                        .with(Protocol::P2pCircuit);
+                                    if let Err(e) = self.swarm.listen_on(circuit_listen) {
+                                        tracing::warn!(
+                                            node = %self.identity.user.user_name,
+                                            relay = %short_id(&relay_bp.peer_id()),
+                                            error = %e,
+                                            "could not reserve relayed address"
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            node = %self.identity.user.user_name,
+                                            relay = %short_id(&relay_bp.peer_id()),
+                                            transport = %short_id(&peer_id),
+                                            "relay transport id resolved; circuit reservation issued"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // A bootstrap dial was issued with unknown transport Peer ID;
                 // the established connection reveals it. Record the
                 // device/transport binding, seed the DHT routing table, and
@@ -1276,6 +1624,29 @@ impl Node {
                     endpoint = ?endpoint,
                     "connection established"
                 );
+                // M2.4: record the transport path (direct vs relayed). The
+                // relayed path is the DCUtR coordination channel; a
+                // successful traversal replaces it with a direct connection.
+                let path = if endpoint.is_relayed() {
+                    PeerPath::Relayed
+                } else {
+                    PeerPath::Direct
+                };
+                if self.peer_paths.insert(peer_id, path).is_none() {
+                    tracing::info!(
+                        node = %self.identity.user.user_name,
+                        peer = %short_id(&peer_id),
+                        path = path.label(),
+                        "connection path established"
+                    );
+                } else {
+                    tracing::info!(
+                        node = %self.identity.user.user_name,
+                        peer = %short_id(&peer_id),
+                        path = path.label(),
+                        "connection path upgraded"
+                    );
+                }
                 None
             }
             SwarmEvent::ConnectionClosed {
@@ -1304,6 +1675,19 @@ impl Node {
                     cause = ?cause,
                     "connection closed"
                 );
+                // M2.4: when the last connection to the peer is gone, the
+                // path returns to disconnected (a traversal failure is
+                // reported separately by the DCUtR event arm).
+                if num_established == 0 {
+                    let was = self.peer_paths.insert(peer_id, PeerPath::Disconnected);
+                    if matches!(was, Some(PeerPath::Direct) | Some(PeerPath::Relayed)) {
+                        tracing::info!(
+                            node = %self.identity.user.user_name,
+                            peer = %short_id(&peer_id),
+                            "connection path lost"
+                        );
+                    }
+                }
                 None
             }
             SwarmEvent::IncomingConnectionError { error, .. } => {
@@ -1338,8 +1722,28 @@ impl Node {
                     for addr in &failed {
                         self.bootstrap_dialing.remove(addr);
                     }
+                    // M2.4: a failed relay-resolution dial is retried.
+                    if let Some(relay_bp) = &self.relay {
+                        if failed
+                            .iter()
+                            .any(|a| relay_bp.multiaddrs().iter().any(|b| b == a))
+                        {
+                            self.relay_dialing = false;
+                        }
+                    }
                     // M2.3: a failed dial-back probe -> report unreachable.
                     self.handle_probe_failure(&failed);
+                }
+                // M2.4: kad's queries dial peers from its routing table
+                // (seeded from established connections). A dead address
+                // there keeps a dial to the peer in flight, which the swarm
+                // uses to cancel the fresh verified record's reconnect dial
+                // (`DialPeerConditionFalse`). Drop failed addresses from
+                // the routing table so queries stop dialing them.
+                if let Some(t) = peer_id {
+                    for addr in &failed {
+                        self.swarm.behaviour_mut().kad.remove_address(&t, addr);
+                    }
                 }
                 if let Some(d) = device {
                     if !failed.is_empty() {
@@ -1381,6 +1785,14 @@ impl Node {
                 }
             }
         }
+    }
+
+    /// Poll the swarm and handle a single event, returning the handled
+    /// session event, if any. Test helpers use this to drive several
+    /// nodes concurrently.
+    pub async fn next_event(&mut self) -> Option<BehaviourEvent> {
+        let event = self.swarm.select_next_some().await;
+        self.handle_event(event)
     }
 
     /// Run maintenance + event handling until `stop` resolves to `true`.
@@ -1455,9 +1867,9 @@ pub enum NodeCommand {
         peer: PeerId,
         reply: tokio::sync::oneshot::Sender<Vec<VerifiedRecord>>,
     },
-    /// List established sessions; reply carries (name, peer id) pairs.
+    /// List established sessions; reply carries (name, peer id, path).
     Peers {
-        reply: tokio::sync::oneshot::Sender<Vec<(String, PeerId)>>,
+        reply: tokio::sync::oneshot::Sender<Vec<(String, PeerId, String)>>,
     },
     /// Shut the node down.
     Quit,
@@ -1499,7 +1911,21 @@ pub async fn run_interactive(node: &mut Node, mut commands: mpsc::Receiver<NodeC
                                     .peer_name(&p)
                                     .map(|s| s.to_string())
                                     .unwrap_or_else(|| "?".to_string());
-                                (name, p)
+                                // M2.4: surface the transport path of the
+                                // session's transport peer.
+                                let transport = node
+                                    .swarm
+                                    .behaviour()
+                                    .session
+                                    .transport_of(&p)
+                                    .copied()
+                                    .unwrap_or(p);
+                                let path = node
+                                    .peer_paths
+                                    .get(&transport)
+                                    .map(|x| x.label().to_string())
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                (name, p, path)
                             })
                             .collect();
                         let _ = reply.send(names);
@@ -1595,6 +2021,8 @@ mod tests {
                 listen_port: 0,
                 bootstrap: Vec::new(),
                 external_ips: Vec::new(),
+                relay: None,
+                relay_server: false,
             },
         )
         .unwrap();
@@ -1619,6 +2047,8 @@ mod tests {
                 listen_port: 0,
                 bootstrap: Vec::new(),
                 external_ips: Vec::new(),
+                relay: None,
+                relay_server: false,
             },
         )
         .unwrap()
@@ -1735,6 +2165,8 @@ mod tests {
                 listen_port: port,
                 bootstrap: Vec::new(),
                 external_ips,
+                relay: None,
+                relay_server: false,
             },
         )
         .unwrap()
