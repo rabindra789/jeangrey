@@ -38,13 +38,15 @@ before exchanging encrypted messages with authenticated acknowledgements.
 - AEAD-encrypted bidirectional messaging with message IDs
 - replay/duplicate protection
 - authenticated delivery acknowledgements
+- observed-address discovery: peers report the public address at which
+  they see you; dial-back validation confirms reachability before the
+  address is advertised in your signed DHT record (M2.3)
 - CLI client/node (`init`, `node`, `lookup`, `send`, `peers`)
 - Windows x86_64 build and Android ARM64 (Termux) build
 - LAN interoperability (Windows ↔ Android, Android ↔ Android)
 
 ## What this release does NOT include
 
-- Internet-wide connectivity
 - NAT traversal / hole punching
 - relay fallback
 - offline messaging / store-and-forward mailbox
@@ -154,15 +156,18 @@ Tested configurations (v1.0.120):
 
 See [`docs/testing.md`](docs/testing.md) for the full walkthroughs and logs.
 
-## Known limitations (v1.0.120)
+## Known limitations
 
-- **LAN only.** No NAT traversal, relay, or Internet connectivity.
-- **Stale DHT addresses.** When a device changes Wi-Fi networks and
-  receives a new IP address, previously published address records become
-  stale. On the branch in development (`feature/mvp2-internet-connectivity`),
-  the publisher re-signs and republishes its record when its address set
-  changes (M2.1), and peers holding a stale cached record invalidate it
-  on dial failure and rediscover the fresh record via the DHT (M2.2).
+- **NAT traversal / relay not implemented.** Nodes on the same LAN or
+  with directly reachable public addresses connect directly. Nodes
+  behind NAT can now discover and advertise the public address at which
+  they are observed and have it dial-back validated (M2.3), but hole
+  punching and relay fallback are not implemented.
+- **Stale DHT addresses — fixed (M2.1 + M2.2).** When a device changes
+  Wi-Fi networks and receives a new IP address, the publisher re-signs
+  and republishes its record when its address set changes (M2.1), and
+  peers holding a stale cached record invalidate it on dial failure and
+  rediscover the fresh record via the DHT (M2.2).
 - **No offline delivery.** Messages are delivered directly over an
   established connection; there is no store-and-forward queue.
 - **Sending to your own Peer ID** hangs in `awaiting acknowledgement...`

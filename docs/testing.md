@@ -4,8 +4,8 @@
 
 | suite | command | scope |
 |---|---|---|
-| unit | `cargo test --lib` | 66 tests: crypto (KEM/ML-DSA/HKDF), handshake (happy path, tampering, timeout), framing (malformed/truncated), session (encryption, replay, ack round trip), records (sign/verify, tamper, skew), identity (Peer ID derivation, key separation), address lifecycle (local-address filtering, change detection), stale-record handling (dial-failure invalidation, rediscovery scheduling, dedup) |
-| integration | `cargo test --test integration` | four end-to-end tests (below) |
+| unit | `cargo test --lib` | 78 tests: crypto (KEM/ML-DSA/HKDF), handshake (happy path, tampering, timeout), framing (malformed/truncated), session (encryption, replay, ack round trip, control frames), records (sign/verify, tamper, skew), identity (Peer ID derivation, key separation), address lifecycle (local-address filtering, change detection), stale-record handling (dial-failure invalidation, rediscovery scheduling, dedup), external-address discovery (classification, candidate lifecycle, validation/rejection, expiry, re-validation, probe dedup/timeout) |
+| integration | `cargo test --test integration` | five end-to-end tests (below) |
 | all | `cargo test --all-targets` | everything; also `cargo clippy --all-targets` and `cargo fmt --check` are clean |
 
 ### Integration tests (`tests/integration/`)
@@ -33,6 +33,17 @@
   the same destination race for a source port (`WSAEADDRINUSE`).
 - `persistence::...` — identity and configuration survive storage
   round-trips.
+- `public_address_discovery::external_address_discovery_validation_and_advertisement` —
+  three real nodes over loopback (A anchor at 9251, B at 9252 with the
+  `external_ips` seam declaring 127.0.0.1 "public", C at 9253): B dials A,
+  A observes B's source address and reports it over the session; B forms
+  the candidate, A probes it back (dial-back validation), B validates and
+  publishes; C then discovers B's record through the DHT, dials the
+  advertised address, and a message round-trips with an authenticated
+  ack. Runtime ~12 s. This is the M2.3 regression test. The loopback
+  test seam (`NodeOptions::external_ips`) stands in for a public IP —
+  on Windows the loopback source is always seen as 127.0.0.1, so a real
+  "external" observed address cannot be produced without it.
 
 ### Environment knobs
 

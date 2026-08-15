@@ -26,6 +26,7 @@ async fn identity_and_history_persist_across_restart() {
         NodeOptions {
             listen_port: 0,
             bootstrap: vec![],
+            external_ips: Vec::new(),
         },
     )
     .unwrap();
@@ -64,6 +65,7 @@ async fn identity_and_history_persist_across_restart() {
         NodeOptions {
             listen_port: 0,
             bootstrap: vec![],
+            external_ips: Vec::new(),
         },
     )
     .unwrap();

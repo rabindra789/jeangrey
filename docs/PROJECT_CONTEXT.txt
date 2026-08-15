@@ -52,8 +52,28 @@ MVP-2 progress
     Tests: 2 new unit tests + 1 new integration test
       (stale_cached_address_recovers_via_rediscovery). Suite now:
       66 unit + 4 integration, all passing.
-  Not yet started: M2.3 Internet direct, M2.4 NAT traversal, M2.5 relay
-    fallback, M2.6 reconnection, M2.7 hardening.
+  M2.3 - External address discovery + dial-back validation (IMPLEMENTED)
+    The acceptor of an inbound connection captures the dialer's source
+      IP and reports it over the authenticated session (new AEAD Control
+      frame type 9; crypto design unchanged).
+    The owner classifies the IP (loopback / local interface -> ignore;
+      else external candidate (IP, own listen port)) and asks the
+      reporter to dial it back. A full handshake validates the candidate,
+      which is merged into the signed DHT record; dial failure or 30 s
+      timeout rejects it (<= 3 attempts, 15 s per attempt; validated
+      addresses re-validated every 300 s).
+    Probes dial with an unknown transport Peer ID and a fresh source
+      port, so they are never suppressed by existing connections or
+      colliding with the listener. Only the requested prober's result
+      is accepted.
+    Tests: 12 new unit tests + 1 new integration test
+      (external_address_discovery_validation_and_advertisement). The
+      loopback test seam (NodeOptions::external_ips) stands in for a
+      public IP — on Windows the loopback source is always seen as
+      127.0.0.1. Suite now: 78 unit + 5 integration, all passing;
+      clippy/fmt clean; aarch64-linux-android check clean.
+  Not yet started: M2.4 NAT traversal, M2.5 relay fallback, M2.6
+    reconnection, M2.7 hardening.
   Do NOT mark mailbox/IPFS/Flutter work complete.
 
 What the release includes
@@ -78,8 +98,10 @@ Physical-device validation
   - Full annotated logs: docs/testing.md
 
 Known limitations (as released / MVP-2 progress)
-  - LAN only; no NAT traversal, relay, or Internet connectivity
-    (M2.3-M2.5 pending).
+  - NAT traversal / relay not implemented (M2.4-M2.5 pending): nodes on
+    the same LAN or with directly reachable public addresses connect
+    directly; observed-address discovery (M2.3) helps advertise a public
+    endpoint behind NAT, but no hole punching or relay fallback yet.
   - Stale DHT addresses after Wi-Fi/network change - FIXED (M2.1 + M2.2):
     the publisher drops addresses whose IP is no longer local and
     republishes immediately (M2.1); the peer side invalidates failed

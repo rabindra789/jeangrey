@@ -175,6 +175,31 @@ sender's sequence number for the ack itself. Acks are AEAD-authenticated and
 only accepted for messages currently awaiting acknowledgement; the message
 id window (16) bounds replay tracking.
 
+### 4.3 Control (type 9, MVP-2 / M2.3)
+
+Control frames carry address-discovery and reachability-validation traffic.
+They are encrypted and authenticated exactly like Message frames (same key
+schedule, same AEAD, same per-direction sequence counter) — the protocol
+design is otherwise unchanged.
+
+Plaintext payloads (tag || body):
+
+| Tag | Frame | Body |
+|-----|-------|------|
+| 0x03 | ObservedAddr | `ip(4\|16) \|\| source_port(2)` |
+| 0x04 | DialBackReq  | `len(1) \|\| multiaddr` |
+| 0x05 | DialBackRes  | `len(1) \|\| multiaddr \|\| reachable(1)` |
+
+- ObservedAddr — sent by the acceptor of an inbound connection right after
+  the handshake, reporting the dialer's source IP and ephemeral source
+  port as seen from the network.
+- DialBackReq — asks the recipient to dial the sender's candidate address
+  back (reachability validation).
+- DialBackRes — the probe outcome (`reachable` = 1 on a full handshake, 0
+  on a failed dial or 30 s timeout).
+- Multiaddrs are capped at `MAX_CONTROL_ADDR_BYTES` (512); longer or
+  truncated payloads are rejected as malformed.
+
 ## 5. Address records (DHT)
 
 Discovery uses Kademlia `get_record`/`put_record` under the JeanGrey
@@ -231,6 +256,26 @@ When a session to a peer is lost, the node:
 Dials allocate a fresh ephemeral source port (`PortUse::New`); the
 listener's own port is never reused for outgoing connections, avoiding
 bind collisions (`WSAEADDRINUSE`) on Windows loopback.
+
+### 5.3 External address discovery (MVP-2 / M2.3)
+
+1. The acceptor of an inbound connection records the dialer's source
+   IP:port and, right after the handshake, sends an `ObservedAddr` control
+   frame (section 4.3) over the session.
+2. The receiver classifies the reported IP: loopback and locally
+   configured interface addresses are ignored; anything else is an
+   external candidate `(IP, own listen port)`.
+3. The candidate owner sends a `DialBackReq` to the reporting peer. The
+   prober dials the candidate with an unknown transport Peer ID and a
+   fresh source port; a full handshake answers `DialBackRes(reachable=1)`,
+   a failed dial or 30 s timeout answers `reachable=0`.
+4. A reachable candidate is validated and merged into the owner's signed
+   DHT record (published with the same `issued_at`/TTL rules). Candidates
+   get at most 3 validation attempts; validated addresses are re-validated
+   every 300 s and dropped from the record when re-validation fails.
+
+The protocol suite (ML-DSA + fresh ML-KEM + HKDF + AEAD, framing, DHT
+record format) is unchanged; only the new Control frame type (9) is added.
 
 ## 6. Connection and session lifecycle
 

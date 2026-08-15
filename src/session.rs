@@ -22,6 +22,10 @@
 //!   are actually awaiting acknowledgement; replayed or forged acks for
 //!   unknown messages are dropped.
 
+use std::net::IpAddr;
+
+use libp2p::Multiaddr;
+
 use crate::crypto::aead;
 use crate::crypto::kdf;
 use crate::framing::{Frame, MessageType};
@@ -33,9 +37,14 @@ pub const MAX_MESSAGE_BYTES: usize = 4096;
 pub const SEEN_WINDOW: usize = 4096;
 /// Max inbound sequence violations before the session is treated as hostile.
 pub const MAX_SEQ_VIOLATIONS: u32 = 5;
+/// Max length of a multiaddr carried in a control frame.
+pub const MAX_CONTROL_ADDR_BYTES: usize = 512;
 
 const MSG_PLAINTEXT_TAG: u8 = 0x01;
 const ACK_PLAINTEXT_TAG: u8 = 0x02;
+const OBSERVED_ADDR_TAG: u8 = 0x03;
+const DIAL_BACK_REQ_TAG: u8 = 0x04;
+const DIAL_BACK_RES_TAG: u8 = 0x05;
 
 /// A decrypted, authenticated inbound event.
 #[derive(Debug, Clone)]
@@ -49,6 +58,22 @@ pub enum Inbound {
     },
     /// An authenticated acknowledgement from the peer.
     Ack { msg_id: u64, ack_seq: u32 },
+    /// The peer reports the address at which it observed OUR connection
+    /// (source IP/port of the inbound connection it accepted from us).
+    ObservedAddr {
+        seq: u32,
+        ip: IpAddr,
+        source_port: u16,
+    },
+    /// The peer asks us to dial a candidate address of theirs (dial-back
+    /// reachability probe).
+    DialBackReq { seq: u32, addr: Multiaddr },
+    /// The result of a dial-back probe we requested.
+    DialBackRes {
+        seq: u32,
+        addr: Multiaddr,
+        reachable: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -157,6 +182,53 @@ impl Session {
         self.seal(MessageType::Ack, seq, rand::random(), &plaintext)
     }
 
+    /// Encrypt and frame an observed-address report (M2.3): tell the peer
+    /// at which IP/port we observed their connection.
+    pub fn encrypt_observed_addr(&mut self, ip: IpAddr, source_port: u16) -> Frame {
+        let mut plaintext = Vec::with_capacity(1 + 1 + 16 + 2);
+        plaintext.push(OBSERVED_ADDR_TAG);
+        match ip {
+            IpAddr::V4(v4) => {
+                plaintext.push(4);
+                plaintext.extend_from_slice(&v4.octets());
+            }
+            IpAddr::V6(v6) => {
+                plaintext.push(16);
+                plaintext.extend_from_slice(&v6.octets());
+            }
+        }
+        plaintext.extend_from_slice(&source_port.to_be_bytes());
+        self.seal_control(plaintext)
+    }
+
+    /// Encrypt and frame a dial-back request (M2.3): ask the peer to probe
+    /// `addr` for us.
+    pub fn encrypt_dial_back_req(&mut self, addr: &Multiaddr) -> Frame {
+        let mut plaintext = Vec::with_capacity(1 + 2 + MAX_CONTROL_ADDR_BYTES);
+        plaintext.push(DIAL_BACK_REQ_TAG);
+        push_addr(&mut plaintext, addr);
+        self.seal_control(plaintext)
+    }
+
+    /// Encrypt and frame a dial-back result (M2.3): report whether a probe
+    /// of `addr` reached the peer.
+    pub fn encrypt_dial_back_res(&mut self, addr: &Multiaddr, reachable: bool) -> Frame {
+        let mut plaintext = Vec::with_capacity(1 + 2 + MAX_CONTROL_ADDR_BYTES + 1);
+        plaintext.push(DIAL_BACK_RES_TAG);
+        push_addr(&mut plaintext, addr);
+        plaintext.push(reachable as u8);
+        self.seal_control(plaintext)
+    }
+
+    fn seal_control(&mut self, plaintext: Vec<u8>) -> Frame {
+        let seq = self.out_seq;
+        self.out_seq = self
+            .out_seq
+            .checked_add(1)
+            .expect("u32 overflow impossible in practice");
+        self.seal(MessageType::Control, seq, rand::random(), &plaintext)
+    }
+
     /// Seal a payload into a session frame.
     fn seal(&self, msg_type: MessageType, seq: u32, msg_id: u64, plaintext: &[u8]) -> Frame {
         let nonce = self.nonce(self.my_dir, seq);
@@ -192,7 +264,7 @@ impl Session {
         self.remember(frame.seq, frame.msg_id);
 
         let plaintext = match frame.msg_type {
-            MessageType::Message | MessageType::Ack => {
+            MessageType::Message | MessageType::Ack | MessageType::Control => {
                 let nonce = self.nonce(self.peer_dir, frame.seq);
                 let aad = self.aad(frame.msg_type, frame.seq, frame.msg_id);
                 aead::open(&self.recv_key, &nonce, &aad, &frame.payload)
@@ -209,13 +281,16 @@ impl Session {
         msg_id: u64,
         plaintext: Vec<u8>,
     ) -> Result<Inbound, SessionError> {
-        if plaintext.len() < 1 + 8 {
+        if plaintext.is_empty() {
             return Err(SessionError::MalformedPlaintext);
         }
         let tag = plaintext[0];
-        let ts = u64::from_be_bytes(plaintext[1..9].try_into().unwrap());
         match (msg_type, tag) {
             (MessageType::Message, MSG_PLAINTEXT_TAG) => {
+                if plaintext.len() < 1 + 8 {
+                    return Err(SessionError::MalformedPlaintext);
+                }
+                let ts = u64::from_be_bytes(plaintext[1..9].try_into().unwrap());
                 let body = std::str::from_utf8(&plaintext[9..])
                     .map_err(|_| SessionError::MalformedPlaintext)?
                     .to_string();
@@ -235,6 +310,60 @@ impl Session {
                 Ok(Inbound::Ack {
                     msg_id: ack_msg_id,
                     ack_seq,
+                })
+            }
+            (MessageType::Control, OBSERVED_ADDR_TAG) => {
+                if plaintext.len() < 1 + 1 + 4 + 2 {
+                    return Err(SessionError::MalformedPlaintext);
+                }
+                let ip_len = plaintext[1] as usize;
+                if plaintext.len() != 1 + 1 + ip_len + 2 || (ip_len != 4 && ip_len != 16) {
+                    return Err(SessionError::MalformedPlaintext);
+                }
+                let ip = match ip_len {
+                    4 => IpAddr::V4(std::net::Ipv4Addr::new(
+                        plaintext[2],
+                        plaintext[3],
+                        plaintext[4],
+                        plaintext[5],
+                    )),
+                    16 => {
+                        let mut o = [0u8; 16];
+                        o.copy_from_slice(&plaintext[2..18]);
+                        IpAddr::V6(std::net::Ipv6Addr::from(o))
+                    }
+                    _ => unreachable!(),
+                };
+                let source_port = u16::from_be_bytes(
+                    plaintext[1 + 1 + ip_len..1 + 1 + ip_len + 2]
+                        .try_into()
+                        .unwrap(),
+                );
+                Ok(Inbound::ObservedAddr {
+                    seq: self.in_seq - 1,
+                    ip,
+                    source_port,
+                })
+            }
+            (MessageType::Control, DIAL_BACK_REQ_TAG) => {
+                let addr = take_addr(&plaintext)?;
+                Ok(Inbound::DialBackReq {
+                    seq: self.in_seq - 1,
+                    addr,
+                })
+            }
+            (MessageType::Control, DIAL_BACK_RES_TAG) => {
+                if plaintext.len() < 1 + 2 + 1 {
+                    return Err(SessionError::MalformedPlaintext);
+                }
+                let (addr, rest) = take_addr_with_rest(&plaintext)?;
+                if rest.len() != 1 {
+                    return Err(SessionError::MalformedPlaintext);
+                }
+                Ok(Inbound::DialBackRes {
+                    seq: self.in_seq - 1,
+                    addr,
+                    reachable: rest[0] == 1,
                 })
             }
             _ => Err(SessionError::MalformedPlaintext),
@@ -284,6 +413,39 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Append `addr` to a control plaintext as `[len u16][bytes]`.
+fn push_addr(out: &mut Vec<u8>, addr: &Multiaddr) {
+    let s = addr.to_string();
+    debug_assert!(s.len() <= MAX_CONTROL_ADDR_BYTES);
+    let len = s.len().min(MAX_CONTROL_ADDR_BYTES) as u16;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(&s.as_bytes()[..len as usize]);
+}
+
+/// Read a `[len u16][bytes]` multiaddr at the start of a control plaintext.
+fn take_addr(plaintext: &[u8]) -> Result<Multiaddr, SessionError> {
+    take_addr_with_rest(plaintext).map(|(a, _)| a)
+}
+
+/// Read a `[len u16][bytes]` multiaddr, returning it and the remaining bytes.
+fn take_addr_with_rest(plaintext: &[u8]) -> Result<(Multiaddr, &[u8]), SessionError> {
+    if plaintext.len() < 1 + 2 + 1 {
+        return Err(SessionError::MalformedPlaintext);
+    }
+    let len = u16::from_be_bytes(plaintext[1..3].try_into().unwrap()) as usize;
+    if len == 0 || len > MAX_CONTROL_ADDR_BYTES {
+        return Err(SessionError::MalformedPlaintext);
+    }
+    let end = 3 + len;
+    if plaintext.len() < end {
+        return Err(SessionError::MalformedPlaintext);
+    }
+    let s =
+        std::str::from_utf8(&plaintext[3..end]).map_err(|_| SessionError::MalformedPlaintext)?;
+    let addr = s.parse().map_err(|_| SessionError::MalformedPlaintext)?;
+    Ok((addr, &plaintext[end..]))
 }
 
 #[cfg(test)]
@@ -424,5 +586,104 @@ mod tests {
         let mut f = a.encrypt_message("y", 100).unwrap();
         f.seq = 8;
         assert!(matches!(b.handle_frame(&f), Err(SessionError::Hostile)));
+    }
+
+    #[test]
+    fn observed_addr_round_trip() {
+        let (mut a, mut b, _, _) = pair_sessions();
+        let ip = "8.8.8.8".parse().unwrap();
+        let f = a.encrypt_observed_addr(ip, 4321);
+        match b.handle_frame(&f).unwrap() {
+            Inbound::ObservedAddr {
+                ip: got,
+                source_port,
+                ..
+            } => {
+                assert_eq!(got, ip);
+                assert_eq!(source_port, 4321);
+            }
+            other => panic!("expected observed addr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn observed_addr_v6_round_trip() {
+        let (mut a, mut b, _, _) = pair_sessions();
+        let ip: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+        let f = a.encrypt_observed_addr(ip, 99);
+        match b.handle_frame(&f).unwrap() {
+            Inbound::ObservedAddr { ip: got, .. } => assert_eq!(got, ip),
+            other => panic!("expected observed addr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dial_back_req_res_round_trip() {
+        let (mut a, mut b, _, _) = pair_sessions();
+        let addr: Multiaddr = "/ip4/8.8.8.8/tcp/9000".parse().unwrap();
+        let f = a.encrypt_dial_back_req(&addr);
+        match b.handle_frame(&f).unwrap() {
+            Inbound::DialBackReq { addr: got, .. } => assert_eq!(got, addr),
+            other => panic!("expected dial-back request, got {other:?}"),
+        }
+        let f = a.encrypt_dial_back_res(&addr, true);
+        match b.handle_frame(&f).unwrap() {
+            Inbound::DialBackRes {
+                addr: got,
+                reachable,
+                ..
+            } => {
+                assert_eq!(got, addr);
+                assert!(reachable);
+            }
+            other => panic!("expected dial-back result, got {other:?}"),
+        }
+        let f = a.encrypt_dial_back_res(&addr, false);
+        match b.handle_frame(&f).unwrap() {
+            Inbound::DialBackRes { reachable, .. } => assert!(!reachable),
+            other => panic!("expected dial-back result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_frames_share_sequence_counter() {
+        let (mut a, mut b, _, _) = pair_sessions();
+        let addr: Multiaddr = "/ip4/8.8.8.8/tcp/9000".parse().unwrap();
+        let f1 = a.encrypt_message("one", 1).unwrap();
+        assert_eq!(f1.seq, 0);
+        let f2 = a.encrypt_dial_back_req(&addr);
+        assert_eq!(f2.seq, 1);
+        let f3 = a.encrypt_observed_addr("1.1.1.1".parse().unwrap(), 5);
+        assert_eq!(f3.seq, 2);
+        assert!(b.handle_frame(&f1).is_ok());
+        assert!(b.handle_frame(&f2).is_ok());
+        assert!(b.handle_frame(&f3).is_ok());
+    }
+
+    #[test]
+    fn malformed_control_frames_rejected() {
+        let (a, _, _, _) = pair_sessions();
+        // A dial-back request whose claimed address length overruns the
+        // plaintext must be rejected.
+        let bad_req = vec![DIAL_BACK_REQ_TAG, 0xff, 1, 2, 3];
+        assert!(matches!(
+            a.parse_plaintext(crate::framing::MessageType::Control, 1, bad_req),
+            Err(SessionError::MalformedPlaintext)
+        ));
+        // A truncated observed-address payload must be rejected.
+        let bad_obs = vec![OBSERVED_ADDR_TAG, 0x01, 1, 2];
+        assert!(matches!(
+            a.parse_plaintext(crate::framing::MessageType::Control, 1, bad_obs),
+            Err(SessionError::MalformedPlaintext)
+        ));
+        // An oversized observed-address payload must be rejected.
+        let mut big_obs = vec![OBSERVED_ADDR_TAG, 0x04];
+        big_obs.extend_from_slice(&[1, 2, 3, 4]);
+        big_obs.extend_from_slice(&[0, 0]);
+        big_obs.extend_from_slice(&[0u8; MAX_CONTROL_ADDR_BYTES]);
+        assert!(matches!(
+            a.parse_plaintext(crate::framing::MessageType::Control, 1, big_obs),
+            Err(SessionError::MalformedPlaintext)
+        ));
     }
 }

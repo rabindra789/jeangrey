@@ -24,6 +24,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::io;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -40,7 +41,7 @@ use libp2p::swarm::handler::{
 use libp2p::swarm::{
     ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, NotifyHandler, ToSwarm,
 };
-use libp2p::{PeerId, Stream};
+use libp2p::{Multiaddr, PeerId, Stream};
 
 use crate::framing::{self, Frame};
 use crate::handshake::{Handshake, HandshakeAction, HandshakeResult};
@@ -385,6 +386,22 @@ pub enum BehaviourEvent {
         msg_id: u64,
         ack_seq: u32,
     },
+    /// The peer reports the address at which it observed our connection
+    /// (M2.3 observed-address discovery).
+    ObservedAddrReported {
+        peer_id: PeerId,
+        ip: IpAddr,
+        source_port: u16,
+    },
+    /// The peer asks us to dial back a candidate address of theirs (M2.3
+    /// reachability validation).
+    DialBackRequested { peer_id: PeerId, addr: Multiaddr },
+    /// The result of a dial-back probe we requested (M2.3).
+    DialBackResolved {
+        peer_id: PeerId,
+        addr: Multiaddr,
+        reachable: bool,
+    },
     /// A connection to a peer was established (transport level).
     PeerConnected { peer_id: PeerId },
     /// The last connection to a peer was closed.
@@ -405,6 +422,9 @@ pub struct SessionBehaviour {
     transport_devices: HashMap<PeerId, PeerId>,
     /// device Peer ID -> transport Peer ID (for disconnects).
     device_transports: HashMap<PeerId, PeerId>,
+    /// Observed source address of each inbound connection (the address at
+    /// which the dialing peer is seen), keyed by (transport peer, conn).
+    observed_addrs: HashMap<(PeerId, ConnectionId), (IpAddr, u16)>,
     queue: VecDeque<
         ToSwarm<BehaviourEvent, ConnectionHandlerEvent<SessionUpgrade, (), BehaviourToHandler>>,
     >,
@@ -421,6 +441,7 @@ impl SessionBehaviour {
             connected: HashSet::new(),
             transport_devices: HashMap::new(),
             device_transports: HashMap::new(),
+            observed_addrs: HashMap::new(),
             queue: VecDeque::new(),
         }
     }
@@ -499,6 +520,51 @@ impl SessionBehaviour {
                 .allocate_new_port()
                 .build(),
         });
+    }
+
+    /// Dial `addr` without a known transport Peer ID: a reachability probe
+    /// (M2.3 dial-back validation). `unknown_peer_id` dials are never
+    /// suppressed by an existing connection to that peer.
+    pub fn connect_probe(&mut self, addr: libp2p::Multiaddr) {
+        self.queue.push_back(ToSwarm::Dial {
+            opts: DialOpts::unknown_peer_id()
+                .address(addr)
+                .allocate_new_port()
+                .build(),
+        });
+    }
+
+    /// Send an observed-address report (M2.3) to a session peer.
+    pub fn send_observed_addr(&mut self, peer: PeerId, ip: IpAddr, source_port: u16) {
+        let Some((transport, conn_id, session)) = self.sessions.get_mut(&peer) else {
+            tracing::debug!(%peer, "observed-addr report dropped: no session");
+            return;
+        };
+        let (transport, conn_id) = (*transport, *conn_id);
+        let frame = session.encrypt_observed_addr(ip, source_port);
+        self.notify_conn(transport, conn_id, vec![frame]);
+    }
+
+    /// Ask a session peer to dial back `addr` (M2.3 reachability probe).
+    pub fn send_dial_back_req(&mut self, peer: PeerId, addr: &libp2p::Multiaddr) {
+        let Some((transport, conn_id, session)) = self.sessions.get_mut(&peer) else {
+            tracing::debug!(%peer, "dial-back request dropped: no session");
+            return;
+        };
+        let (transport, conn_id) = (*transport, *conn_id);
+        let frame = session.encrypt_dial_back_req(addr);
+        self.notify_conn(transport, conn_id, vec![frame]);
+    }
+
+    /// Report the result of a dial-back probe (M2.3).
+    pub fn send_dial_back_res(&mut self, peer: PeerId, addr: &libp2p::Multiaddr, reachable: bool) {
+        let Some((transport, conn_id, session)) = self.sessions.get_mut(&peer) else {
+            tracing::debug!(%peer, "dial-back result dropped: no session");
+            return;
+        };
+        let (transport, conn_id) = (*transport, *conn_id);
+        let frame = session.encrypt_dial_back_res(addr, reachable);
+        self.notify_conn(transport, conn_id, vec![frame]);
     }
 
     /// Record the transport Peer ID behind `device`, learned from an
@@ -582,6 +648,12 @@ impl SessionBehaviour {
                 let session = Session::new(&result);
                 self.sessions.insert(device, (transport, conn_id, session));
                 self.flush_pending_sends(device, transport, conn_id);
+                // M2.3: if this connection was INBOUND, tell the peer the
+                // address at which we observed it (external address
+                // discovery). The receiver decides what to do with it.
+                if let Some((ip, source_port)) = self.observed_addrs.remove(&(transport, conn_id)) {
+                    self.send_observed_addr(device, ip, source_port);
+                }
                 self.queue
                     .push_back(ToSwarm::GenerateEvent(BehaviourEvent::SessionEstablished {
                         peer_id: device,
@@ -635,6 +707,34 @@ impl SessionBehaviour {
                         peer_id: device,
                         msg_id,
                         ack_seq,
+                    }));
+            }
+            Ok(Inbound::ObservedAddr {
+                ip, source_port, ..
+            }) => {
+                self.queue.push_back(ToSwarm::GenerateEvent(
+                    BehaviourEvent::ObservedAddrReported {
+                        peer_id: device,
+                        ip,
+                        source_port,
+                    },
+                ));
+            }
+            Ok(Inbound::DialBackReq { addr, .. }) => {
+                self.queue
+                    .push_back(ToSwarm::GenerateEvent(BehaviourEvent::DialBackRequested {
+                        peer_id: device,
+                        addr,
+                    }));
+            }
+            Ok(Inbound::DialBackRes {
+                addr, reachable, ..
+            }) => {
+                self.queue
+                    .push_back(ToSwarm::GenerateEvent(BehaviourEvent::DialBackResolved {
+                        peer_id: device,
+                        addr,
+                        reachable,
                     }));
             }
             Err(e) => {
@@ -703,6 +803,29 @@ impl NetworkBehaviour for SessionBehaviour {
         match event {
             FromSwarm::ConnectionEstablished(established) => {
                 self.connected.insert(established.peer_id);
+                // Inbound connection: record where the DIALER is seen from.
+                // This is the observed (source) address used for external
+                // address discovery (M2.3).
+                if let libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } =
+                    &established.endpoint
+                {
+                    let ip = send_back_addr.iter().find_map(|p| match p {
+                        libp2p::multiaddr::Protocol::Ip4(i) => Some(IpAddr::V4(i)),
+                        libp2p::multiaddr::Protocol::Ip6(i) => Some(IpAddr::V6(i)),
+                        _ => None,
+                    });
+                    let port = send_back_addr
+                        .iter()
+                        .find_map(|p| match p {
+                            libp2p::multiaddr::Protocol::Tcp(p) => Some(p),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    if let Some(ip) = ip {
+                        self.observed_addrs
+                            .insert((established.peer_id, established.connection_id), (ip, port));
+                    }
+                }
                 let peer_id = self
                     .device_of(&established.peer_id)
                     .unwrap_or(established.peer_id);
@@ -713,6 +836,8 @@ impl NetworkBehaviour for SessionBehaviour {
             }
             FromSwarm::ConnectionClosed(closed) => {
                 let transport = closed.peer_id;
+                self.observed_addrs
+                    .remove(&(transport, closed.connection_id));
                 let device = self.device_of(&transport);
                 self.connected.remove(&transport);
                 self.handshakes.remove(&(transport, closed.connection_id));

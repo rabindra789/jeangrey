@@ -3,6 +3,7 @@
 mod address_lifecycle;
 mod messaging;
 mod persistence;
+mod public_address_discovery;
 mod stale_rediscovery;
 
 use std::sync::OnceLock;

@@ -28,6 +28,7 @@ fn node_at(storage: Storage, id: DeviceIdentity, port: u16, bootstrap: Vec<Boots
         NodeOptions {
             listen_port: port,
             bootstrap,
+            external_ips: Vec::new(),
         },
     )
     .unwrap()

@@ -65,9 +65,35 @@ is **TBD** (to be decided); the current CLI binary ships as `jeangrey`
   B1 dies → stale 9242 refused → rediscovery → B2's 9244 → session +
   authenticated ack). Suite now: 66 unit + 4 integration, all passing.
 
+### M2.3 — External address discovery + dial-back validation (implemented)
+
+- A node behind NAT only knows its local interface addresses. M2.3 adds
+  observed-address discovery: the acceptor of an inbound connection
+  captures the dialer's source IP and reports it over the authenticated
+  session (new AEAD Control frame type 9 — the crypto design is
+  unchanged).
+- The owner classifies the IP (loopback / local interface → ignore;
+  else external candidate `(IP, own listen port)`) and asks the reporter
+  to dial it back. A full handshake validates the candidate, which is
+  then merged into the signed DHT record and advertised alongside local
+  addresses; dial failure or 30 s timeout rejects it (≤ 3 attempts,
+  15 s per attempt; validated addresses re-validated every 300 s).
+- Probes dial with an unknown transport Peer ID and a fresh source port,
+  so they are never suppressed by existing connections or colliding with
+  the listener. Only the requested prober's result is accepted.
+- Tests: 12 new unit tests (classification, candidate lifecycle,
+  validation/rejection/expiry, re-validation, probe dedup/timeout,
+  control-frame round trips) + 1 new integration test
+  (`external_address_discovery_validation_and_advertisement`: A observes
+  B, B validates via dial-back and publishes, C discovers and connects
+  through the advertised address). The loopback test seam
+  (`NodeOptions::external_ips`) stands in for a public IP — on Windows
+  the loopback source is always observed as 127.0.0.1. Suite now:
+  78 unit + 5 integration, all passing; clippy and fmt clean;
+  aarch64-linux-android check clean.
+
 ### Not yet started (MVP-2 remaining)
 
-- M2.3 Internet direct connectivity
 - M2.4 NAT traversal
 - M2.5 relay fallback
 - M2.6 reconnection
@@ -99,8 +125,11 @@ out of scope per `docs/PROJECT_CONTEXT.md` (see below).
 
 ## Known limitations (as released / MVP-2 progress)
 
-- **LAN only.** No NAT traversal, relay, or Internet connectivity
-  (MVP-2 M2.3–M2.5 pending).
+- **NAT traversal / relay not implemented (M2.4–M2.5 pending).** Nodes
+  on the same LAN or with directly reachable public addresses connect
+  directly; discovery via observed addresses (M2.3) helps nodes behind
+  NAT advertise their public endpoint, but no hole punching or relay
+  fallback exists yet.
 - **Stale DHT addresses after Wi-Fi/network change — FIXED (M2.1 + M2.2).**
   The publisher drops addresses whose IP is no longer local and
   republishes immediately (M2.1); the peer side invalidates failed

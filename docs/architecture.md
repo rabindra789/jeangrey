@@ -154,6 +154,51 @@ PeerDisconnected (had_session)
   bootstrap loop cannot issue duplicate dials to the same address while
   one is in flight.
 
+### Address lifecycle (MVP-2 / M2.3): external address discovery
+
+A node behind NAT knows only its local interface addresses. M2.3 lets a
+peer *discover* the public address at which it is reachable, *validate*
+it, and *advertise* it in its signed DHT record.
+
+```
+inbound connection (Listener side)
+        └──> capture dialer source IP:port (send_back_addr)
+        └──> after handshake: ObservedAddr control frame (AEAD)
+                └──> receiver classifies the IP
+                      ├── loopback / local interface ──> ignore (log)
+                      └── external ──> candidate = (IP, own listen_port)
+                                        └──> DialBackReq to the reporter
+                                              └──> prober dials candidate
+                                                    (fresh source port)
+                                                    ├── handshake ok ──> DialBackRes(true)
+                                                    │      └──> candidate validated,
+                                                    │           merged into signed
+                                                    │           record at publish
+                                                    └── dial fails / 30 s timeout
+                                                           └──> DialBackRes(false)
+                                                                 └──> candidate rejected
+```
+
+- Classification (`is_external_ip`): loopback and addresses configured on
+  a local interface are local; everything else is external. A failed
+  interface scan is fail-safe (external). `NodeOptions::external_ips`
+  (empty in production) is a loopback test seam.
+- The candidate address always uses the *own listen port* — the observed
+  source port is ephemeral and cannot be dialed back.
+- The dial-back probe is dialed with an unknown transport Peer ID and a
+  fresh ephemeral source port, so it can never be suppressed by an
+  existing connection or collide with the listener (M2.2 lesson).
+- A successful probe replaces the existing session (latest-wins); the
+  stale connection lingers briefly then closes (harmless reconnect
+  churn). Only the prober we asked may answer for a candidate.
+- `MAX_VALIDATION_ATTEMPTS` (3) rejection budget, `VALIDATION_TIMEOUT`
+  (15 s) per attempt, `PROBE_TIMEOUT` (30 s) on the prober side, and
+  `PUBLIC_REVALIDATE_INTERVAL` (300 s) periodic re-validation of
+  validated addresses. Failed re-validation removes the address from the
+  published record.
+- Validated addresses are merged into the signed record at publish time
+  (M2.1 integration) and are advertised alongside the local addresses.
+
 ## 5. Sessions
 
 - One authenticated session per device (`sessions` map in

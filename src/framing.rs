@@ -38,6 +38,7 @@ pub enum MessageType {
     Message = 6,
     Ack = 7,
     Error = 8,
+    Control = 9,
 }
 
 impl MessageType {
@@ -51,6 +52,7 @@ impl MessageType {
             6 => Some(MessageType::Message),
             7 => Some(MessageType::Ack),
             8 => Some(MessageType::Error),
+            9 => Some(MessageType::Control),
             _ => None,
         }
     }
@@ -81,7 +83,10 @@ impl Frame {
     }
 
     pub fn is_session_frame(&self) -> bool {
-        matches!(self.msg_type, MessageType::Message | MessageType::Ack)
+        matches!(
+            self.msg_type,
+            MessageType::Message | MessageType::Ack | MessageType::Control
+        )
     }
 }
 

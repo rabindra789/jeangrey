@@ -42,6 +42,16 @@ pub const LOOKUP_RETRY_DELAY: Duration = Duration::from_secs(1);
 pub const RECONNECT_DIAL_DELAY: Duration = Duration::from_secs(2);
 /// Delay before a dynamic rediscovery lookup after a session loss.
 pub const RECONNECT_DELAY: Duration = Duration::from_secs(3);
+/// How long an observed-address candidate may wait for its dial-back result
+/// before being treated as unreachable (M2.3).
+pub const VALIDATION_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a validated public address stays trusted before re-validation.
+pub const PUBLIC_REVALIDATE_INTERVAL: Duration = Duration::from_secs(300);
+/// Maximum dial-back attempts per observed candidate before it expires.
+pub const MAX_VALIDATION_ATTEMPTS: u32 = 3;
+/// How long a dial-back probe may stay in flight before it is reported as
+/// unreachable (M2.3).
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Composed network behaviour.
 #[derive(NetworkBehaviour)]
@@ -106,10 +116,13 @@ impl BootstrapPeer {
 }
 
 /// Configuration for a node run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NodeOptions {
     pub listen_port: u16,
     pub bootstrap: Vec<BootstrapPeer>,
+    /// IPs to treat as external even when they look local (loopback test
+    /// seam; empty in production).
+    pub external_ips: Vec<IpAddr>,
 }
 
 /// One in-flight discovery lookup.
@@ -134,6 +147,32 @@ struct RetryDial {
     transport: PeerId,
     addrs: Vec<Multiaddr>,
     next_at: Instant,
+}
+
+/// Lifecycle of one observed-address candidate (M2.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CandidateState {
+    /// Dial-back validation in flight.
+    Pending { since: Instant },
+    /// Dial-back succeeded; the address is published.
+    Validated { since: Instant },
+    /// Dial-back failed or timed out.
+    Rejected { attempts: u32 },
+}
+
+/// An externally observed candidate address, with its validation state.
+#[derive(Debug, Clone)]
+struct Candidate {
+    state: CandidateState,
+    /// The peer that reported this candidate and can probe it.
+    prober: PeerId,
+}
+
+/// A dial-back probe we are running for a peer (M2.3).
+#[derive(Debug, Clone)]
+struct PendingProbe {
+    addr: Multiaddr,
+    since: Instant,
 }
 
 /// Filter `addrs` down to the addresses whose IP is still configured on a
@@ -219,6 +258,17 @@ pub struct Node {
     /// failure removes the failed candidates (possibly the whole record),
     /// which triggers a dynamic rediscovery.
     pub records: HashMap<PeerId, VerifiedRecord>,
+    /// Observed-address candidates and their validation state (M2.3).
+    candidates: HashMap<Multiaddr, Candidate>,
+    /// Public addresses proven reachable by a dial-back probe (M2.3);
+    /// merged into the signed DHT record at publish time.
+    validated_public_addrs: Vec<Multiaddr>,
+    /// Dial-back probes we are running (keyed by the probed device).
+    pending_probes: HashMap<PeerId, PendingProbe>,
+    /// Port our listener is bound to (used to build candidate addresses).
+    listen_port: u16,
+    /// IPs to treat as external even when they look local (test seam).
+    external_ips: Vec<IpAddr>,
 }
 
 impl Node {
@@ -300,6 +350,11 @@ impl Node {
             had_session: HashSet::new(),
             retry_dials: VecDeque::new(),
             records: HashMap::new(),
+            candidates: HashMap::new(),
+            validated_public_addrs: Vec::new(),
+            pending_probes: HashMap::new(),
+            listen_port: options.listen_port,
+            external_ips: options.external_ips,
         };
         Ok(node)
     }
@@ -370,7 +425,14 @@ impl Node {
 
     /// Record the current listen addresses and re-publish to the DHT.
     pub fn publish_record(&mut self) {
-        let addrs = self.current_addrs.clone();
+        let mut addrs = self.current_addrs.clone();
+        // M2.3: validated public addresses ride along in the same signed
+        // record (M2.1 republish semantics apply to them too).
+        for a in &self.validated_public_addrs {
+            if !addrs.contains(a) {
+                addrs.push(a.clone());
+            }
+        }
         if addrs.is_empty() {
             return;
         }
@@ -458,6 +520,11 @@ impl Node {
         self.records.values().cloned().collect()
     }
 
+    /// Public addresses proven reachable by dial-back probes (M2.3).
+    pub fn validated_public_addrs(&self) -> Vec<Multiaddr> {
+        self.validated_public_addrs.clone()
+    }
+
     /// Whether a discovery lookup for `peer` is pending or already queued.
     fn lookup_in_flight(&self, peer: &PeerId) -> bool {
         self.pending_lookups.values().any(|r| &r.peer == peer)
@@ -504,6 +571,312 @@ impl Node {
             });
         }
         self.schedule_rediscovery(peer, RECONNECT_DELAY);
+    }
+
+    /// Whether `ip` is treated as an external (non-local) address for
+    /// observed-address discovery (M2.3). Loopback and local interface IPs
+    /// are local; `external_ips` (a loopback test seam) overrides. A failed
+    /// interface scan is fail-safe toward "external": the dial-back probe
+    /// is the real gate.
+    fn is_external_ip(&self, ip: &IpAddr) -> bool {
+        if self.external_ips.contains(ip) {
+            return true;
+        }
+        if ip.is_loopback() {
+            return false;
+        }
+        match local_ip_set() {
+            Some(local) => !local.contains(ip),
+            None => true,
+        }
+    }
+
+    /// The candidate address formed from an observed external IP: the
+    /// observed IP paired with OUR listen port (the address a remote peer
+    /// would dial). `None` when we have no usable listen port.
+    fn candidate_for(&self, ip: &IpAddr) -> Option<Multiaddr> {
+        if self.listen_port == 0 {
+            return None;
+        }
+        let addr = match ip {
+            IpAddr::V4(v4) => format!("/ip4/{v4}/tcp/{}", self.listen_port),
+            IpAddr::V6(v6) => format!("/ip6/{v6}/tcp/{}", self.listen_port),
+        };
+        addr.parse().ok()
+    }
+
+    /// Ask the candidate's prober (or any connected peer) to dial `addr`
+    /// back and report whether it reaches us (M2.3 reachability probe).
+    fn request_dial_back(&mut self, addr: &Multiaddr) {
+        let prober = {
+            let Some(c) = self.candidates.get(addr) else {
+                return;
+            };
+            if self.has_session(&c.prober) {
+                c.prober
+            } else if let Some(fallback) = self.session_peers().into_iter().next() {
+                fallback
+            } else {
+                tracing::debug!(
+                    node = %self.identity.user.user_name,
+                    %addr,
+                    "no peer available to probe candidate"
+                );
+                return;
+            }
+        };
+        self.candidates.get_mut(addr).expect("checked above").prober = prober;
+        tracing::info!(
+            node = %self.identity.user.user_name,
+            peer = %short_id(&prober),
+            %addr,
+            "requesting dial-back validation"
+        );
+        self.swarm
+            .behaviour_mut()
+            .session
+            .send_dial_back_req(prober, addr);
+    }
+
+    /// Handle an observed-address report (M2.3): classify the IP, form a
+    /// candidate with our listen port, and start dial-back validation.
+    fn on_observed_addr(&mut self, peer: PeerId, ip: IpAddr, source_port: u16) {
+        if !self.is_external_ip(&ip) {
+            tracing::info!(
+                node = %self.identity.user.user_name,
+                peer = %short_id(&peer),
+                %ip,
+                "observed address matches a local interface; not a public candidate"
+            );
+            return;
+        }
+        let Some(addr) = self.candidate_for(&ip) else {
+            return;
+        };
+        // If we are already listening on the candidate address there is
+        // nothing to validate — unless the operator's `external_ips` seam
+        // explicitly declares the IP public (test harness), in which case
+        // the full validation pipeline still runs.
+        if !self.external_ips.contains(&ip) && self.current_addrs.contains(&addr) {
+            tracing::info!(
+                node = %self.identity.user.user_name,
+                peer = %short_id(&peer),
+                %addr,
+                "observed address is already a local listen address; skipping"
+            );
+            return;
+        }
+        if let Some(c) = self.candidates.get(&addr) {
+            match c.state {
+                CandidateState::Validated { .. } => {
+                    tracing::debug!(
+                        node = %self.identity.user.user_name,
+                        %addr,
+                        "observed address already validated"
+                    );
+                    return;
+                }
+                CandidateState::Pending { .. } => return,
+                CandidateState::Rejected { attempts } => {
+                    if attempts >= MAX_VALIDATION_ATTEMPTS {
+                        tracing::warn!(
+                            node = %self.identity.user.user_name,
+                            %addr,
+                            "observed address candidate expired after repeated rejections"
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        tracing::info!(
+            node = %self.identity.user.user_name,
+            peer = %short_id(&peer),
+            %addr,
+            observed_port = source_port,
+            "observed address candidate; scheduling dial-back validation"
+        );
+        self.candidates.insert(
+            addr.clone(),
+            Candidate {
+                state: CandidateState::Pending {
+                    since: Instant::now(),
+                },
+                prober: peer,
+            },
+        );
+        self.request_dial_back(&addr);
+    }
+
+    /// Handle a dial-back request (M2.3 prober side): dial the candidate
+    /// and report the outcome.
+    fn on_dial_back_req(&mut self, peer: PeerId, addr: Multiaddr) {
+        if self.pending_probes.contains_key(&peer) {
+            tracing::debug!(
+                node = %self.identity.user.user_name,
+                peer = %short_id(&peer),
+                %addr,
+                "dial-back probe already in flight"
+            );
+            return;
+        }
+        tracing::info!(
+            node = %self.identity.user.user_name,
+            peer = %short_id(&peer),
+            %addr,
+            "dial-back probe requested; dialing candidate"
+        );
+        self.pending_probes.insert(
+            peer,
+            PendingProbe {
+                addr: addr.clone(),
+                since: Instant::now(),
+            },
+        );
+        self.swarm.behaviour_mut().session.connect_probe(addr);
+    }
+
+    /// Handle a dial-back result (M2.3 owner side): validate or reject the
+    /// candidate, and republish the record on any change.
+    fn on_dial_back_res(&mut self, peer: PeerId, addr: Multiaddr, reachable: bool) {
+        {
+            let Some(c) = self.candidates.get_mut(&addr) else {
+                return;
+            };
+            // Only the prober we asked may answer for this candidate.
+            if c.prober != peer {
+                return;
+            }
+            if reachable {
+                if matches!(c.state, CandidateState::Validated { .. }) {
+                    return;
+                }
+                c.state = CandidateState::Validated {
+                    since: Instant::now(),
+                };
+                if !self.validated_public_addrs.contains(&addr) {
+                    self.validated_public_addrs.push(addr.clone());
+                }
+                tracing::info!(
+                    node = %self.identity.user.user_name,
+                    %addr,
+                    "validated public address; adding to published record"
+                );
+            } else {
+                let attempts = match c.state {
+                    CandidateState::Rejected { attempts } => attempts + 1,
+                    _ => 1,
+                };
+                c.state = CandidateState::Rejected { attempts };
+                self.validated_public_addrs.retain(|a| a != &addr);
+                tracing::warn!(
+                    node = %self.identity.user.user_name,
+                    peer = %short_id(&peer),
+                    %addr,
+                    attempts,
+                    "rejected candidate; dial-back failed"
+                );
+            }
+        }
+        self.publish_record();
+    }
+
+    /// A dial-back probe whose connection failed: report the candidate
+    /// unreachable to its owner and drop the probe (M2.3).
+    fn handle_probe_failure(&mut self, failed: &[Multiaddr]) {
+        let matched: Vec<(PeerId, Multiaddr)> = self
+            .pending_probes
+            .iter()
+            .filter(|(_, p)| failed.contains(&p.addr))
+            .map(|(peer, p)| (*peer, p.addr.clone()))
+            .collect();
+        for (probed, addr) in matched {
+            tracing::warn!(
+                node = %self.identity.user.user_name,
+                peer = %short_id(&probed),
+                %addr,
+                "dial-back probe failed; reporting unreachable"
+            );
+            self.pending_probes.remove(&probed);
+            self.swarm
+                .behaviour_mut()
+                .session
+                .send_dial_back_res(probed, &addr, false);
+        }
+    }
+
+    /// Periodic M2.3 maintenance: time out hung probes, reject candidates
+    /// whose validation timed out, and re-validate aged public addresses.
+    fn public_addr_maintenance(&mut self) {
+        let now = Instant::now();
+        // Probes in flight too long -> report unreachable.
+        let expired: Vec<PeerId> = self
+            .pending_probes
+            .iter()
+            .filter(|(_, p)| p.since.elapsed() >= PROBE_TIMEOUT)
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in expired {
+            let addr = self.pending_probes.remove(&peer).expect("present").addr;
+            tracing::warn!(
+                node = %self.identity.user.user_name,
+                peer = %short_id(&peer),
+                %addr,
+                "dial-back probe timed out; reporting unreachable"
+            );
+            self.swarm
+                .behaviour_mut()
+                .session
+                .send_dial_back_res(peer, &addr, false);
+        }
+        // Candidates whose validation timed out -> rejected.
+        let timed_out: Vec<Multiaddr> = self
+            .candidates
+            .iter()
+            .filter(|(_, c)| {
+                matches!(c.state, CandidateState::Pending { since } if since.elapsed() >= VALIDATION_TIMEOUT)
+            })
+            .map(|(addr, _)| addr.clone())
+            .collect();
+        for addr in timed_out {
+            let attempts = {
+                let c = self.candidates.get_mut(&addr).expect("present");
+                let attempts = match c.state {
+                    CandidateState::Rejected { attempts } => attempts + 1,
+                    _ => 1,
+                };
+                c.state = CandidateState::Rejected { attempts };
+                attempts
+            };
+            self.validated_public_addrs.retain(|a| a != &addr);
+            tracing::warn!(
+                node = %self.identity.user.user_name,
+                %addr,
+                attempts,
+                "rejected candidate; validation timed out"
+            );
+        }
+        // Validated candidates due for re-validation.
+        let due: Vec<Multiaddr> = self
+            .candidates
+            .iter()
+            .filter(|(_, c)| {
+                matches!(c.state, CandidateState::Validated { since } if since.elapsed() >= PUBLIC_REVALIDATE_INTERVAL)
+            })
+            .map(|(addr, _)| addr.clone())
+            .collect();
+        for addr in &due {
+            self.candidates.get_mut(addr).expect("present").state =
+                CandidateState::Pending { since: now };
+            tracing::info!(
+                node = %self.identity.user.user_name,
+                %addr,
+                "re-validating public address"
+            );
+        }
+        for addr in &due {
+            self.request_dial_back(addr);
+        }
     }
 
     /// Drop `failed` addresses from the cached record of `device` (dial
@@ -644,6 +1017,21 @@ impl Node {
                 );
                 self.had_session.insert(*peer_id);
                 self.dialing.remove(peer_id);
+                // M2.3: a dial-back probe connection succeeded -> report
+                // the candidate reachable to its owner.
+                if let Some(probe) = self.pending_probes.remove(peer_id) {
+                    tracing::info!(
+                        node = %self.identity.user.user_name,
+                        peer = %short_id(peer_id),
+                        addr = %probe.addr,
+                        "dial-back probe reached the peer; reporting reachable"
+                    );
+                    self.swarm.behaviour_mut().session.send_dial_back_res(
+                        *peer_id,
+                        &probe.addr,
+                        true,
+                    );
+                }
                 let _ = self
                     .storage
                     .append_history(crate::storage::HistoryKind::Sent {
@@ -701,12 +1089,32 @@ impl Node {
                         status: "delivered".into(),
                     });
             }
+            BehaviourEvent::ObservedAddrReported {
+                peer_id,
+                ip,
+                source_port,
+            } => {
+                self.on_observed_addr(*peer_id, *ip, *source_port);
+            }
+            BehaviourEvent::DialBackRequested { peer_id, addr } => {
+                self.on_dial_back_req(*peer_id, addr.clone());
+            }
+            BehaviourEvent::DialBackResolved {
+                peer_id,
+                addr,
+                reachable,
+            } => {
+                self.on_dial_back_res(*peer_id, addr.clone(), *reachable);
+            }
             BehaviourEvent::PeerConnected { peer_id } => {
                 self.connected.insert(*peer_id);
             }
             BehaviourEvent::PeerDisconnected { peer_id } => {
                 self.connected.remove(peer_id);
                 tracing::info!(node = %self.identity.user.user_name, peer = %short_id(peer_id), "peer disconnected");
+                // A dial-back probe's owner is gone; its result can no
+                // longer be delivered.
+                self.pending_probes.remove(peer_id);
                 // Reconnect: the peer had a session; re-dial its cached
                 // record (which may be stale — the failure invalidates it)
                 // and refresh the record from the DHT in parallel.
@@ -726,6 +1134,8 @@ impl Node {
         if self.last_publish.elapsed() >= PUBLISH_INTERVAL {
             self.publish_record();
         }
+        // M2.3: probe timeouts, candidate expiry, public-address re-validation.
+        self.public_addr_maintenance();
         // Fire scheduled re-dials of cached address records (reconnect).
         let now = Instant::now();
         while let Some(dial) = self.retry_dials.front() {
@@ -928,6 +1338,8 @@ impl Node {
                     for addr in &failed {
                         self.bootstrap_dialing.remove(addr);
                     }
+                    // M2.3: a failed dial-back probe -> report unreachable.
+                    self.handle_probe_failure(&failed);
                 }
                 if let Some(d) = device {
                     if !failed.is_empty() {
@@ -1182,6 +1594,7 @@ mod tests {
             NodeOptions {
                 listen_port: 0,
                 bootstrap: Vec::new(),
+                external_ips: Vec::new(),
             },
         )
         .unwrap();
@@ -1205,6 +1618,7 @@ mod tests {
             NodeOptions {
                 listen_port: 0,
                 bootstrap: Vec::new(),
+                external_ips: Vec::new(),
             },
         )
         .unwrap()
@@ -1306,6 +1720,219 @@ mod tests {
         assert!(
             !node.records.contains_key(&target.peer_id),
             "a record with no surviving candidates is removed"
+        );
+    }
+
+    fn m23_node(name: &str, port: u16, external_ips: Vec<IpAddr>) -> Node {
+        let id = crate::identity::DeviceIdentity::generate(name);
+        let storage = crate::storage::Storage::new(
+            std::env::temp_dir().join(format!("jg-unit-{name}-{}", std::process::id())),
+        );
+        Node::new(
+            id,
+            storage,
+            NodeOptions {
+                listen_port: port,
+                bootstrap: Vec::new(),
+                external_ips,
+            },
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn observed_ip_classification() {
+        // Loopback is always local unless the seam says otherwise.
+        let plain = m23_node("classify-plain", 9320, Vec::new());
+        assert!(!plain.is_external_ip(&"127.0.0.1".parse().unwrap()));
+        // Non-local, non-loopback IPs are external.
+        assert!(plain.is_external_ip(&"203.0.113.9".parse().unwrap()));
+        // The seam forces a loopback IP to be treated as external.
+        let seamed = m23_node("classify-seam", 9320, vec!["127.0.0.1".parse().unwrap()]);
+        assert!(seamed.is_external_ip(&"127.0.0.1".parse().unwrap()));
+        // IPv6 loopback is local too.
+        assert!(!plain.is_external_ip(&"::1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn observed_addr_forms_candidate_and_validates() {
+        let mut node = m23_node("candidate", 9321, vec!["127.0.0.1".parse().unwrap()]);
+        let reporter = crate::identity::DeviceIdentity::generate("reporter").peer_id;
+        let candidate = maddr("/ip4/127.0.0.1/tcp/9321");
+
+        // A local IP with no seam produces no candidate.
+        let mut plain = m23_node("candidate-plain", 9322, Vec::new());
+        plain.on_observed_addr(reporter, "127.0.0.1".parse().unwrap(), 12345);
+        assert!(
+            plain.candidates.is_empty(),
+            "loopback without the seam must not become a candidate"
+        );
+
+        // Observed -> pending candidate.
+        node.on_observed_addr(reporter, "127.0.0.1".parse().unwrap(), 12345);
+        assert_eq!(node.candidates.len(), 1);
+        assert!(matches!(
+            node.candidates.get(&candidate).unwrap().state,
+            CandidateState::Pending { .. }
+        ));
+
+        // Duplicate report while pending is deduplicated.
+        node.on_observed_addr(reporter, "127.0.0.1".parse().unwrap(), 12345);
+        assert_eq!(node.candidates.len(), 1);
+
+        // Dial-back success -> validated and merged into the record.
+        node.on_dial_back_res(reporter, candidate.clone(), true);
+        assert!(matches!(
+            node.candidates.get(&candidate).unwrap().state,
+            CandidateState::Validated { .. }
+        ));
+        assert_eq!(
+            node.validated_public_addrs(),
+            vec![candidate.clone()],
+            "validated address must be published"
+        );
+        node.publish_record();
+        assert!(
+            node.our_record
+                .addrs
+                .iter()
+                .any(|a| a == &candidate.to_string()),
+            "signed record must carry the validated public address"
+        );
+
+        // A second validation of the same address is a no-op.
+        node.on_dial_back_res(reporter, candidate.clone(), true);
+        assert_eq!(node.validated_public_addrs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dial_back_failure_rejects_and_result_from_wrong_peer_ignored() {
+        let mut node = m23_node("reject", 9323, vec!["127.0.0.1".parse().unwrap()]);
+        let reporter = crate::identity::DeviceIdentity::generate("reporter").peer_id;
+        let stranger = crate::identity::DeviceIdentity::generate("stranger").peer_id;
+        let candidate = maddr("/ip4/127.0.0.1/tcp/9323");
+
+        node.on_observed_addr(reporter, "127.0.0.1".parse().unwrap(), 1);
+        // A result from a peer that is not the prober is ignored.
+        node.on_dial_back_res(stranger, candidate.clone(), true);
+        assert!(node.validated_public_addrs().is_empty());
+
+        // The real prober reports unreachable -> rejected.
+        node.on_dial_back_res(reporter, candidate.clone(), false);
+        assert!(matches!(
+            node.candidates.get(&candidate).unwrap().state,
+            CandidateState::Rejected { attempts: 1 }
+        ));
+        assert!(node.validated_public_addrs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_candidate_times_out_and_expires_after_attempts() {
+        let mut node = m23_node("expire", 9324, vec!["127.0.0.1".parse().unwrap()]);
+        let reporter = crate::identity::DeviceIdentity::generate("reporter").peer_id;
+        let candidate = maddr("/ip4/127.0.0.1/tcp/9324");
+
+        node.on_observed_addr(reporter, "127.0.0.1".parse().unwrap(), 1);
+        // Age the pending candidate past the validation window.
+        node.candidates.get_mut(&candidate).unwrap().state = CandidateState::Pending {
+            since: Instant::now() - VALIDATION_TIMEOUT - Duration::from_secs(1),
+        };
+        node.public_addr_maintenance();
+        assert!(matches!(
+            node.candidates.get(&candidate).unwrap().state,
+            CandidateState::Rejected { attempts: 1 }
+        ));
+
+        // Three more failed validations exhaust the attempts budget.
+        node.on_observed_addr(reporter, "127.0.0.1".parse().unwrap(), 1);
+        assert!(
+            matches!(
+                node.candidates.get(&candidate).unwrap().state,
+                CandidateState::Pending { .. }
+            ),
+            "a fresh report with attempts left re-probes"
+        );
+        node.on_dial_back_res(reporter, candidate.clone(), false);
+        node.on_dial_back_res(reporter, candidate.clone(), false);
+        node.on_dial_back_res(reporter, candidate.clone(), false);
+        assert!(matches!(
+            node.candidates.get(&candidate).unwrap().state,
+            CandidateState::Rejected { attempts: 3 }
+        ));
+        // No further attempts once the budget is exhausted.
+        node.on_observed_addr(reporter, "127.0.0.1".parse().unwrap(), 1);
+        assert!(matches!(
+            node.candidates.get(&candidate).unwrap().state,
+            CandidateState::Rejected { attempts: 3 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn validated_address_is_revalidated_when_due() {
+        let mut node = m23_node("revalidate", 9325, vec!["127.0.0.1".parse().unwrap()]);
+        let reporter = crate::identity::DeviceIdentity::generate("reporter").peer_id;
+        let candidate = maddr("/ip4/127.0.0.1/tcp/9325");
+
+        node.on_observed_addr(reporter, "127.0.0.1".parse().unwrap(), 1);
+        node.on_dial_back_res(reporter, candidate.clone(), true);
+        assert_eq!(node.validated_public_addrs().len(), 1);
+
+        // Age the validated address past the re-validation window.
+        node.candidates.get_mut(&candidate).unwrap().state = CandidateState::Validated {
+            since: Instant::now() - PUBLIC_REVALIDATE_INTERVAL - Duration::from_secs(1),
+        };
+        node.public_addr_maintenance();
+        assert!(
+            matches!(
+                node.candidates.get(&candidate).unwrap().state,
+                CandidateState::Pending { .. }
+            ),
+            "a validated address due for re-validation returns to pending"
+        );
+
+        // Re-validation failure removes it from the published set.
+        node.on_dial_back_res(reporter, candidate.clone(), false);
+        assert!(
+            node.validated_public_addrs().is_empty(),
+            "failed re-validation removes the address from the record"
+        );
+    }
+
+    #[tokio::test]
+    async fn dial_back_request_dedups_and_probe_reports_unreachable() {
+        let mut node = m23_node("prober", 9326, Vec::new());
+        let owner = crate::identity::DeviceIdentity::generate("owner").peer_id;
+        let candidate = maddr("/ip4/203.0.113.7/tcp/9326");
+
+        node.on_dial_back_req(owner, candidate.clone());
+        node.on_dial_back_req(owner, candidate.clone());
+        assert_eq!(node.pending_probes.len(), 1, "probes dedup per device");
+
+        // A failed probe dial reports unreachable to the owner.
+        node.handle_probe_failure(std::slice::from_ref(&candidate));
+        assert!(
+            node.pending_probes.is_empty(),
+            "a failed probe is removed after reporting"
+        );
+
+        // The same address can be probed again afterwards.
+        node.on_dial_back_req(owner, candidate.clone());
+        assert_eq!(node.pending_probes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_probe_times_out_and_reports_unreachable() {
+        let mut node = m23_node("probe-timeout", 9327, Vec::new());
+        let owner = crate::identity::DeviceIdentity::generate("owner").peer_id;
+        let candidate = maddr("/ip4/203.0.113.8/tcp/9327");
+
+        node.on_dial_back_req(owner, candidate.clone());
+        node.pending_probes.get_mut(&owner).unwrap().since =
+            Instant::now() - PROBE_TIMEOUT - Duration::from_secs(1);
+        node.public_addr_maintenance();
+        assert!(
+            node.pending_probes.is_empty(),
+            "a timed-out probe is reported unreachable and removed"
         );
     }
 }

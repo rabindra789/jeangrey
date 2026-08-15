@@ -113,6 +113,7 @@ fn build_options(common: &Common) -> Result<NodeOptions> {
     Ok(NodeOptions {
         listen_port,
         bootstrap,
+        external_ips: Vec::new(),
     })
 }
 
